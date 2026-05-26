@@ -1,0 +1,35 @@
+[package]
+name = "diffist"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, native git diff viewer for macOS"
+
+[dependencies]
+# GPU-rendered immediate-mode GUI. wgpu backend -> Metal on macOS (Zed-style rendering).
+eframe = { version = "0.29", default-features = false, features = ["wgpu"] }
+egui = "0.29"
+# libgit2 bindings (vendored build via cc, no system cmake needed).
+git2 = "0.19"
+# Native file/folder open dialogs.
+rfd = "0.15"
+# Memory-map large files instead of reading them into the heap.
+memmap2 = "0.9"
+# SIMD-accelerated newline scanning for the line index.
+memchr = "2"
+# Rope buffer for efficient large-file text editing.
+ropey = "1"
+# Native macOS menu bar (NSMenu).
+muda = "0.15"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Set the native window/titlebar appearance to dark.
+objc2-foundation = "0.2"
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSAppearance",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
