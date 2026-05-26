@@ -18,6 +18,7 @@ pub struct Menus {
     pub settings: MenuId,
     pub editor: MenuId,
     pub diff: MenuId,
+    pub agent: MenuId,
     _menu: Menu, // kept alive for the app's lifetime
 }
 
@@ -63,7 +64,12 @@ impl Menus {
             true,
             Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit2)),
         );
-        let _ = view_menu.append_items(&[&editor, &diff]);
+        let agent = MenuItem::new(
+            "Agent",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit3)),
+        );
+        let _ = view_menu.append_items(&[&editor, &diff, &agent]);
 
         let _ = menu.append_items(&[&app_menu, &file_menu, &view_menu]);
 
@@ -76,6 +82,7 @@ impl Menus {
             settings: settings.id().clone(),
             editor: editor.id().clone(),
             diff: diff.id().clone(),
+            agent: agent.id().clone(),
             _menu: menu,
         }
     }

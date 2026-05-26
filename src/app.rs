@@ -10,7 +10,8 @@ use crate::editor::Editor;
 use crate::gitmodel::{self, CommitInfo, FileChange};
 use crate::menu::Menus;
 use crate::settings::Settings;
-use crate::{fstree, textview, theme};
+use crate::terminal::Terminal;
+use crate::{agent, fstree, textview, theme};
 
 const PANEL_LEFT_PAD: f32 = 12.0;
 
@@ -18,6 +19,7 @@ const PANEL_LEFT_PAD: f32 = 12.0;
 enum Mode {
     FileBrowser,
     GitDiff,
+    Agent,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -35,6 +37,8 @@ pub struct DiffistApp {
     editor: Option<Editor>,
     file_status: String,
     last_dirty: bool,
+    file_mtime: Option<std::time::SystemTime>,
+    external_changed: bool,
 
     // --- Git Diff mode ---
     repo: Option<Repository>,
@@ -55,6 +59,33 @@ pub struct DiffistApp {
     menus: Menus,
     settings: Settings,
     title_dirty: bool,
+
+    // --- File-tree operations ---
+    file_clipboard: Option<PathBuf>,
+    prompt: Option<FilePrompt>,
+    prompt_text: String,
+    prompt_error: String,
+
+    // --- Find in Files ---
+    project_search: crate::search::ProjectSearch,
+    // --- Quick-open / command palette ---
+    palette: crate::palette::Palette,
+
+    // --- Agent mode ---
+    sessions: Vec<agent::AgentSession>,
+    /// Selected session tracked by id (indices shift as the list is rescanned).
+    selected_session: Option<String>,
+    terminal: Option<Terminal>,
+    agent_status: String,
+    agent_scan_at: std::time::Instant,
+}
+
+/// A pending file-tree text prompt (modal naming dialog).
+#[derive(Clone)]
+enum FilePrompt {
+    NewFile(PathBuf),
+    NewFolder(PathBuf),
+    Rename(PathBuf),
 }
 
 impl DiffistApp {
@@ -74,6 +105,8 @@ impl DiffistApp {
             editor: None,
             file_status: String::new(),
             last_dirty: false,
+            file_mtime: None,
+            external_changed: false,
             repo: None,
             diff_tab: DiffSidebarTab::Changed,
             local_changes: Vec::new(),
@@ -90,6 +123,17 @@ impl DiffistApp {
             menus: Menus::install(),
             settings: Settings::default(),
             title_dirty: false,
+            file_clipboard: None,
+            prompt: None,
+            prompt_text: String::new(),
+            prompt_error: String::new(),
+            project_search: crate::search::ProjectSearch::default(),
+            palette: crate::palette::Palette::default(),
+            sessions: Vec::new(),
+            selected_session: None,
+            terminal: None,
+            agent_status: String::new(),
+            agent_scan_at: std::time::Instant::now(),
         };
         if let Some(dir) = initial_dir {
             app.open_folder(&dir);
@@ -104,7 +148,28 @@ impl DiffistApp {
 impl eframe::App for DiffistApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_menu();
-        self.handle_global_shortcuts(ctx);
+        // View switching is via the native View menu: ⌘1 Editor / ⌘2 Diff / ⌘3 Agent.
+        // ⌘⇧F → Find in Files. Consume before the editor sees the key (its ⌘F
+        // handler ignores Shift and would otherwise also fire).
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::F)
+        }) {
+            self.mode = Mode::FileBrowser;
+            self.project_search.reveal();
+        }
+        // ⌘⇧P command palette, ⌘P file quick-open. Consume so the editor (which
+        // ignores them anyway) never sees the keys.
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P)
+        }) {
+            self.palette.open_commands();
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            if let Some(root) = self.root.clone() {
+                self.palette.open_files(&root);
+            }
+        }
+        self.handle_palette(ctx);
+        self.check_external_change();
         self.settings.apply(ctx);
         // Reflect unsaved-changes state in the title bar.
         let dirty = self.editor.as_ref().is_some_and(|e| e.is_dirty());
@@ -118,8 +183,10 @@ impl eframe::App for DiffistApp {
         match self.mode {
             Mode::FileBrowser => self.file_browser_ui(ctx),
             Mode::GitDiff => self.git_diff_ui(ctx),
+            Mode::Agent => self.agent_ui(ctx),
         }
         self.settings.ui(ctx);
+        self.file_prompt_ui(ctx);
 
         // Native menu clicks don't wake the window, so poll a few times a second.
         ctx.request_repaint_after(std::time::Duration::from_millis(150));
@@ -138,7 +205,8 @@ impl DiffistApp {
                     ui.label(RichText::new("Diffist").color(theme::TEXT_DIM).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(4.0);
-                        // Right-to-left: "Diff" hugs the corner, "Editor" to its left.
+                        // Right-to-left: "Agent" hugs the corner, then Diff, then Editor.
+                        ui.selectable_value(&mut self.mode, Mode::Agent, "  Agent  ");
                         ui.selectable_value(&mut self.mode, Mode::GitDiff, "  Diff  ");
                         ui.selectable_value(&mut self.mode, Mode::FileBrowser, "  Editor  ");
                     });
@@ -156,37 +224,16 @@ impl DiffistApp {
                     self.open_folder(&dir);
                 }
             } else if *id == self.menus.save {
-                if let Some(editor) = &mut self.editor {
-                    let _ = editor.save();
-                }
+                self.save_current();
             } else if *id == self.menus.settings {
                 self.settings.open = true;
             } else if *id == self.menus.editor {
                 self.mode = Mode::FileBrowser;
             } else if *id == self.menus.diff {
                 self.mode = Mode::GitDiff;
+            } else if *id == self.menus.agent {
+                self.mode = Mode::Agent;
             }
-        }
-    }
-
-    fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.settings.is_recording_shortcut() || self.mode == Mode::FileBrowser {
-            return;
-        }
-
-        let editor_shortcut = self.settings.editor_shortcut();
-        let switch_editor =
-            ctx.input_mut(|i| i.consume_key(editor_shortcut.modifiers(), editor_shortcut.key()));
-        if switch_editor {
-            self.mode = Mode::FileBrowser;
-            return;
-        }
-
-        let diff_shortcut = self.settings.diff_shortcut();
-        let switch_diff =
-            ctx.input_mut(|i| i.consume_key(diff_shortcut.modifiers(), diff_shortcut.key()));
-        if switch_diff {
-            self.mode = Mode::GitDiff;
         }
     }
 
@@ -218,6 +265,12 @@ impl DiffistApp {
         self.selected_change = None;
         self.diff_lines.clear();
 
+        // Drop any running terminal (sends shutdown) and rescan agent sessions.
+        self.terminal = None;
+        self.selected_session = None;
+        self.agent_status.clear();
+        self.sessions = agent::scan(dir);
+
         match Repository::discover(dir) {
             Ok(repo) => {
                 match gitmodel::workdir_changes(&repo) {
@@ -245,6 +298,120 @@ impl DiffistApp {
         }
     }
 
+    // ---------------- Agent mode ----------------
+
+    /// Two columns: Codex sessions for this folder on the left, an interactive
+    /// terminal for the selected session on the right.
+    fn agent_ui(&mut self, ctx: &egui::Context) {
+        // Re-scan periodically so sessions started just now (whose transcript
+        // files are written a moment after launch), or in other terminals,
+        // appear without reopening the folder.
+        if let Some(root) = self.root.clone() {
+            if self.agent_scan_at.elapsed() >= std::time::Duration::from_secs(2) {
+                self.sessions = agent::scan(&root);
+                self.agent_scan_at = std::time::Instant::now();
+            }
+        }
+
+        egui::SidePanel::left("agent_sessions")
+            .resizable(true)
+            .default_width(300.0)
+            .frame(egui::Frame::none().fill(theme::SIDEBAR))
+            .show(ctx, |ui| {
+                section_header(ui, "AGENT SESSIONS");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    let width = (ui.available_width() - 30.0).max(60.0) / 2.0;
+                    let new_codex = ui
+                        .add_sized(
+                            Vec2::new(width, 30.0),
+                            egui::Button::new(RichText::new("+ Codex").color(theme::TEXT))
+                                .fill(theme::RAISED),
+                        )
+                        .clicked();
+                    let new_claude = ui
+                        .add_sized(
+                            Vec2::new(width, 30.0),
+                            egui::Button::new(RichText::new("+ Claude").color(theme::TEXT))
+                                .fill(theme::RAISED),
+                        )
+                        .clicked();
+                    if new_codex {
+                        self.selected_session = None;
+                        self.start_terminal(ui.ctx(), Some("codex".to_string()));
+                    } else if new_claude {
+                        self.selected_session = None;
+                        self.start_terminal(ui.ctx(), Some("claude".to_string()));
+                    }
+                });
+                ui.add_space(8.0);
+
+                let font_size = self.settings.ui_font_size();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut select = None;
+                        for s in self.sessions.iter() {
+                            let selected = self.selected_session.as_deref() == Some(s.id.as_str());
+                            if session_row(ui, s, selected, font_size).clicked() {
+                                select = Some(s.id.clone());
+                            }
+                        }
+                        if self.sessions.is_empty() {
+                            empty_list_message(ui, "No agent sessions for this folder");
+                        }
+                        if let Some(id) = select {
+                            self.open_session(ui.ctx(), &id);
+                        }
+                    });
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(theme::INSET))
+            .show(ctx, |ui| {
+                if self.root.is_none() {
+                    diff_empty_state(ui, "Open a folder to use agents");
+                    return;
+                }
+                match &mut self.terminal {
+                    Some(term) => {
+                        agent_terminal_header(ui, term.exited(), &self.agent_status);
+                        term.ui(ui);
+                    }
+                    None => diff_empty_state(
+                        ui,
+                        "Select a session to resume, or start a new Codex session",
+                    ),
+                }
+            });
+    }
+
+    fn open_session(&mut self, ctx: &egui::Context, id: &str) {
+        let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
+            return;
+        };
+        let command = session.resume_command();
+        self.selected_session = Some(id.to_string());
+        self.start_terminal(ctx, Some(command));
+    }
+
+    /// (Re)spawn the terminal in the open folder, optionally typing an initial
+    /// command line into the freshly launched login shell.
+    fn start_terminal(&mut self, ctx: &egui::Context, command: Option<String>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.terminal = None; // drop the previous child first
+        match Terminal::spawn(ctx, root, command) {
+            Ok(term) => {
+                self.terminal = Some(term);
+                self.agent_status.clear();
+            }
+            Err(e) => self.agent_status = format!("terminal error: {e}"),
+        }
+    }
+
     // ---------------- File Browser mode ----------------
 
     fn file_browser_ui(&mut self, ctx: &egui::Context) {
@@ -254,13 +421,29 @@ impl DiffistApp {
             .show(ctx, |ui| {
                 section_header(ui, "EXPLORER");
                 if let Some(root) = self.root.clone() {
-                    if let Some(path) = fstree::show(ui, &root, self.selected_file.as_deref()) {
+                    let can_paste = self.file_clipboard.is_some();
+                    let (clicked, action) =
+                        fstree::show(ui, &root, self.selected_file.as_deref(), can_paste);
+                    if let Some(path) = clicked {
                         self.load_file(&path);
+                    }
+                    if let Some(action) = action {
+                        self.handle_tree_action(action, ui.ctx());
                     }
                 } else {
                     ui.weak("File ▸ Open Folder…  (⌘O)");
                 }
             });
+
+        // Find-in-Files results (bottom panel, added before the central panel).
+        if let Some(root) = self.root.clone() {
+            if let Some(target) = self.project_search.ui(ctx, &root) {
+                self.load_file(&target.path);
+                if let Some(editor) = &mut self.editor {
+                    editor.reveal_match(target.line, target.col, target.len);
+                }
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(path) = self.selected_file.clone() else {
@@ -273,6 +456,25 @@ impl DiffistApp {
                 .map(|e| e.status())
                 .unwrap_or_else(|| self.file_status.clone());
             file_header(ui, &path, &status);
+
+            // Banner shown when the file changed on disk while you have edits.
+            if self.external_changed {
+                egui::Frame::none()
+                    .fill(theme::DIFF_DEL_BG)
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("⚠ File changed on disk").color(theme::YELLOW));
+                            if ui.button("Reload").clicked() {
+                                self.load_file(&path);
+                            }
+                            if ui.button("Keep mine").clicked() {
+                                self.external_changed = false;
+                            }
+                        });
+                    });
+            }
+
             match &mut self.editor {
                 Some(editor) => editor.ui(ui),
                 None => {
@@ -285,6 +487,8 @@ impl DiffistApp {
 
     fn load_file(&mut self, path: &Path) {
         self.selected_file = Some(path.to_path_buf());
+        self.file_mtime = file_mtime(path);
+        self.external_changed = false;
         match Editor::open(path) {
             Ok(editor) => {
                 self.editor = Some(editor);
@@ -294,6 +498,216 @@ impl DiffistApp {
                 self.editor = None;
                 self.file_status = format!("cannot edit (not UTF-8?): {e}");
             }
+        }
+    }
+
+    /// Save and refresh the tracked mtime so our own write isn't mistaken for an
+    /// external change.
+    fn save_current(&mut self) {
+        if let Some(editor) = &mut self.editor {
+            if editor.save().is_ok() {
+                self.file_mtime = self.selected_file.as_deref().and_then(file_mtime);
+                self.external_changed = false;
+            }
+        }
+    }
+
+    /// Detect when the open file changed on disk: silently reload if there are
+    /// no unsaved edits, otherwise raise a banner.
+    fn check_external_change(&mut self) {
+        if self.external_changed || self.editor.is_none() {
+            return;
+        }
+        let Some(path) = self.selected_file.clone() else {
+            return;
+        };
+        let Some(cur) = file_mtime(&path) else { return };
+        if Some(cur) != self.file_mtime {
+            self.file_mtime = Some(cur);
+            if self.editor.as_ref().is_some_and(Editor::is_dirty) {
+                self.external_changed = true;
+            } else {
+                self.load_file(&path);
+            }
+        }
+    }
+
+    // ---------------- File-tree operations ----------------
+
+    fn handle_tree_action(&mut self, action: fstree::TreeAction, ctx: &egui::Context) {
+        use fstree::TreeAction::*;
+        match action {
+            NewFile(dir) => self.open_prompt(FilePrompt::NewFile(dir), String::new()),
+            NewFolder(dir) => self.open_prompt(FilePrompt::NewFolder(dir), String::new()),
+            Rename(path) => {
+                let name = file_name_string(&path);
+                self.open_prompt(FilePrompt::Rename(path), name);
+            }
+            Delete(path) => {
+                if trash::delete(&path).is_ok() && self.selected_file.as_deref() == Some(&*path) {
+                    self.selected_file = None;
+                    self.editor = None;
+                }
+            }
+            Duplicate(path) => {
+                let _ = copy_into(&path, &unique_sibling(&path));
+            }
+            CopyFile(path) => self.file_clipboard = Some(path),
+            Paste(dir) => {
+                if let Some(src) = self.file_clipboard.clone() {
+                    let mut dest = dir.join(file_name_string(&src));
+                    if dest == src || dest.exists() {
+                        dest = unique_sibling(&dest);
+                    }
+                    let _ = copy_into(&src, &dest);
+                }
+            }
+            RevealInFinder(path) => {
+                let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+            }
+            OpenInTerminal(dir) => {
+                let _ = std::process::Command::new("open")
+                    .args(["-a", "Terminal"])
+                    .arg(&dir)
+                    .spawn();
+            }
+            CopyPath(path) => ctx.copy_text(path.to_string_lossy().into_owned()),
+            CopyRelativePath(path) => {
+                let rel = self
+                    .root
+                    .as_ref()
+                    .and_then(|r| path.strip_prefix(r).ok())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                ctx.copy_text(rel);
+            }
+        }
+    }
+
+    fn open_prompt(&mut self, prompt: FilePrompt, initial: String) {
+        self.prompt = Some(prompt);
+        self.prompt_text = initial;
+        self.prompt_error.clear();
+    }
+
+    /// Modal naming dialog for new-file / new-folder / rename.
+    fn file_prompt_ui(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.prompt.clone() else {
+            return;
+        };
+        let title = match prompt {
+            FilePrompt::NewFile(_) => "New File",
+            FilePrompt::NewFolder(_) => "New Folder",
+            FilePrompt::Rename(_) => "Rename",
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.prompt_text)
+                        .desired_width(300.0)
+                        .hint_text("name"),
+                );
+                resp.request_focus();
+                if !self.prompt_error.is_empty() {
+                    ui.colored_label(theme::RED, &self.prompt_error);
+                }
+                ui.horizontal(|ui| {
+                    submit |= ui.button("OK").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+                submit |= ui.input(|i| i.key_pressed(egui::Key::Enter));
+                cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
+            });
+        if cancel {
+            self.prompt = None;
+        } else if submit {
+            self.apply_prompt(prompt);
+        }
+    }
+
+    fn apply_prompt(&mut self, prompt: FilePrompt) {
+        let name = self.prompt_text.trim().to_owned();
+        if name.is_empty() || name.contains('/') {
+            self.prompt_error = "Invalid name".to_owned();
+            return;
+        }
+        let result: std::io::Result<Option<PathBuf>> = match &prompt {
+            FilePrompt::NewFile(dir) => {
+                let p = dir.join(&name);
+                if p.exists() {
+                    Err(already_exists())
+                } else {
+                    std::fs::write(&p, b"").map(|_| Some(p))
+                }
+            }
+            FilePrompt::NewFolder(dir) => {
+                let p = dir.join(&name);
+                if p.exists() {
+                    Err(already_exists())
+                } else {
+                    std::fs::create_dir(&p).map(|_| None)
+                }
+            }
+            FilePrompt::Rename(path) => {
+                let dest = path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(&name);
+                if dest.exists() && dest != *path {
+                    Err(already_exists())
+                } else {
+                    let was_open = self.selected_file.as_deref() == Some(path.as_path());
+                    std::fs::rename(path, &dest).map(|_| was_open.then_some(dest))
+                }
+            }
+        };
+        match result {
+            Ok(open) => {
+                self.prompt = None;
+                self.prompt_error.clear();
+                if let Some(p) = open {
+                    self.load_file(&p);
+                }
+            }
+            Err(e) => self.prompt_error = e.to_string(),
+        }
+    }
+
+    fn handle_palette(&mut self, ctx: &egui::Context) {
+        use crate::palette::{Command, PaletteAction};
+        let Some(action) = self.palette.ui(ctx) else {
+            return;
+        };
+        match action {
+            PaletteAction::OpenFile(path) => {
+                self.mode = Mode::FileBrowser;
+                self.load_file(&path);
+            }
+            PaletteAction::GotoLine(n) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.reveal_match(n.saturating_sub(1), 0, 0);
+                }
+            }
+            PaletteAction::Run(cmd) => match cmd {
+                Command::OpenFolder => {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        self.open_folder(&dir);
+                    }
+                }
+                Command::Save => self.save_current(),
+                Command::ModeEditor => self.mode = Mode::FileBrowser,
+                Command::ModeDiff => self.mode = Mode::GitDiff,
+                Command::FindInFiles => {
+                    self.mode = Mode::FileBrowser;
+                    self.project_search.reveal();
+                }
+                Command::Settings => self.settings.open = true,
+            },
         }
     }
 
@@ -926,6 +1340,99 @@ fn commit_row(
     ))
 }
 
+fn session_row(
+    ui: &mut egui::Ui,
+    session: &agent::AgentSession,
+    selected: bool,
+    font_size: f32,
+) -> egui::Response {
+    let row_h = 52.0;
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
+    if let Some(fill) = row_bg(selected, response.hovered()) {
+        ui.painter()
+            .rect_filled(rect.shrink2(Vec2::new(8.0, 3.0)), 6.0, fill);
+    }
+
+    // Kind badge (e.g. "codex" / "claude").
+    let badge_color = agent_kind_color(session.kind);
+    let badge_font = FontId::monospace(font_size * 0.66);
+    let label = session.kind.label();
+    let badge_w = text_width(ui, label, badge_font.clone()) + 12.0;
+    let badge = Rect::from_min_size(
+        Pos2::new(rect.left() + 14.0, rect.top() + 9.0),
+        Vec2::new(badge_w, 16.0),
+    );
+    ui.painter()
+        .rect_filled(badge, 4.0, badge_color.linear_multiply(0.22));
+    ui.painter().text(
+        badge.center(),
+        Align2::CENTER_CENTER,
+        label,
+        badge_font,
+        badge_color,
+    );
+    // Start time, to the right of the badge.
+    ui.painter().text(
+        Pos2::new(badge.right() + 8.0, badge.center().y),
+        Align2::LEFT_CENTER,
+        agent::format_started(&session.started),
+        FontId::proportional(font_size * 0.72),
+        theme::TEXT_MUTED,
+    );
+
+    // Second line: the opening prompt if known, otherwise the short id.
+    let short_id: String = session.id.chars().take(8).collect();
+    let second = if session.summary.is_empty() {
+        short_id
+    } else {
+        session.summary.clone()
+    };
+    let second_font = FontId::proportional(font_size * 0.85);
+    let avail = (rect.right() - rect.left() - 28.0).max(20.0);
+    ui.painter().text(
+        Pos2::new(rect.left() + 14.0, rect.top() + 30.0),
+        Align2::LEFT_TOP,
+        ellipsize(ui, &second, second_font.clone(), avail),
+        second_font,
+        if selected { theme::TEXT } else { theme::TEXT_DIM },
+    );
+    response.on_hover_text(&session.id)
+}
+
+fn agent_kind_color(kind: agent::AgentKind) -> Color32 {
+    match kind {
+        agent::AgentKind::Codex => theme::GREEN,
+        agent::AgentKind::ClaudeCode => theme::ACCENT,
+    }
+}
+
+/// Thin strip above the terminal: the resumed session id / running state.
+fn agent_terminal_header(ui: &mut egui::Ui, exited: bool, status: &str) {
+    let rect = ui.available_rect_before_wrap();
+    let height = 26.0;
+    let (header, _) = ui.allocate_exact_size(Vec2::new(rect.width(), height), Sense::hover());
+    ui.painter().rect_filled(header, 0.0, theme::SURFACE);
+    ui.painter().line_segment(
+        [header.left_bottom(), header.right_bottom()],
+        Stroke::new(1.0, theme::BORDER),
+    );
+    let label = if !status.is_empty() {
+        status.to_string()
+    } else if exited {
+        "session ended".to_string()
+    } else {
+        "running".to_string()
+    };
+    ui.painter().text(
+        Pos2::new(header.left() + 14.0, header.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(ui_font_size(ui) * 0.78),
+        if exited { theme::TEXT_MUTED } else { theme::GREEN },
+    );
+}
+
 fn row_bg(selected: bool, hovered: bool) -> Option<Color32> {
     if selected {
         Some(theme::SIDEBAR_SELECTED)
@@ -1065,5 +1572,66 @@ fn status_color(s: char) -> Color32 {
         'D' => theme::RED,
         'R' | 'C' => theme::ACCENT,
         _ => theme::TEXT_DIM,
+    }
+}
+
+// ---------------- file-tree helpers ----------------
+
+fn already_exists() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::AlreadyExists, "already exists")
+}
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn file_name_string(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Build a non-existing sibling path by appending " copy" (then " copy 2", …),
+/// preserving the extension for files.
+fn unique_sibling(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let is_dir = path.is_dir();
+    let (stem, ext) = if is_dir {
+        (file_name_string(path), None)
+    } else {
+        (
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path.extension().map(|e| e.to_string_lossy().into_owned()),
+        )
+    };
+    let build = |label: &str| -> PathBuf {
+        let name = match &ext {
+            Some(e) => format!("{stem} {label}.{e}"),
+            None => format!("{stem} {label}"),
+        };
+        parent.join(name)
+    };
+    let mut candidate = build("copy");
+    let mut i = 2;
+    while candidate.exists() {
+        candidate = build(&format!("copy {i}"));
+        i += 1;
+    }
+    candidate
+}
+
+/// Recursively copy a file or directory to `dest`.
+fn copy_into(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dest)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_into(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dest).map(|_| ())
     }
 }

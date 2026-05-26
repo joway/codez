@@ -1,9 +1,8 @@
 //! Appearance settings + the settings window.
 //!
-//! Keeps the global UI font, editor/diff monospace font, and a small set of
-//! configurable app-level shortcuts.
+//! Keeps the global UI font and the editor/diff monospace font.
 
-use egui::{Context, FontData, FontDefinitions, FontFamily, FontId, Key, Modifiers, TextStyle};
+use egui::{Context, FontData, FontDefinitions, FontFamily, FontId, TextStyle};
 
 const CJK_FONTS: &[&str] = &[
     "/System/Library/Fonts/PingFang.ttc",
@@ -81,59 +80,12 @@ impl MonoFont {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ShortcutAction {
-    EditorPage,
-    DiffPage,
-}
-
-#[derive(Clone, Copy)]
-pub struct KeyBinding {
-    key: Key,
-    modifiers: Modifiers,
-}
-
-impl KeyBinding {
-    fn new(key: Key, modifiers: Modifiers) -> Self {
-        Self { key, modifiers }
-    }
-
-    pub fn key(self) -> Key {
-        self.key
-    }
-
-    pub fn modifiers(self) -> Modifiers {
-        self.modifiers
-    }
-
-    fn label(self) -> String {
-        let mut parts = Vec::new();
-        if self.modifiers.command {
-            parts.push("Cmd");
-        }
-        if self.modifiers.ctrl {
-            parts.push("Ctrl");
-        }
-        if self.modifiers.alt {
-            parts.push("Option");
-        }
-        if self.modifiers.shift {
-            parts.push("Shift");
-        }
-        parts.push(key_label(self.key));
-        parts.join("+")
-    }
-}
-
 pub struct Settings {
     pub open: bool,
     ui_font_size: f32,
     editor_font_size: f32,
     ui_font: UiFont,
     mono: MonoFont,
-    editor_shortcut: KeyBinding,
-    diff_shortcut: KeyBinding,
-    recording: Option<ShortcutAction>,
     dirty: bool,
 }
 
@@ -145,9 +97,6 @@ impl Default for Settings {
             editor_font_size: 16.0,
             ui_font: UiFont::SfPro,
             mono: MonoFont::SfMono,
-            editor_shortcut: KeyBinding::new(Key::E, Modifiers::COMMAND),
-            diff_shortcut: KeyBinding::new(Key::D, Modifiers::COMMAND),
-            recording: None,
             dirty: true,
         }
     }
@@ -156,18 +105,6 @@ impl Default for Settings {
 impl Settings {
     pub fn ui_font_size(&self) -> f32 {
         self.ui_font_size
-    }
-
-    pub fn editor_shortcut(&self) -> KeyBinding {
-        self.editor_shortcut
-    }
-
-    pub fn diff_shortcut(&self) -> KeyBinding {
-        self.diff_shortcut
-    }
-
-    pub fn is_recording_shortcut(&self) -> bool {
-        self.recording.is_some()
     }
 
     /// Re-apply fonts and text sizes to the context when something changed.
@@ -248,8 +185,6 @@ impl Settings {
 
     /// Draw the settings window if open.
     pub fn ui(&mut self, ctx: &Context) {
-        self.capture_recorded_shortcut(ctx);
-
         let mut open = self.open;
         egui::Window::new("Settings")
             .open(&mut open)
@@ -316,80 +251,10 @@ impl Settings {
                         ui.end_row();
                     });
 
-                ui.add_space(14.0);
-                settings_section(ui, "Shortcuts");
-                egui::Grid::new("shortcut_settings_grid")
-                    .num_columns(3)
-                    .spacing([18.0, 10.0])
-                    .show(ui, |ui| {
-                        self.shortcut_row(ui, "Editor page", ShortcutAction::EditorPage);
-                        self.shortcut_row(ui, "Diff page", ShortcutAction::DiffPage);
-                    });
-
                 ui.add_space(8.0);
-                match self.recording {
-                    Some(_) => ui.weak("Press the new shortcut. Esc cancels recording."),
-                    None => ui.weak("Editor font applies to the editor and diff text."),
-                };
+                ui.weak("Editor font applies to the editor and diff text.");
             });
         self.open = open;
-    }
-
-    fn shortcut_row(&mut self, ui: &mut egui::Ui, label: &str, action: ShortcutAction) {
-        ui.label(label);
-        ui.monospace(self.shortcut(action).label());
-        let recording = self.recording == Some(action);
-        let button = if recording { "Recording..." } else { "Record" };
-        if ui.button(button).clicked() {
-            self.recording = Some(action);
-        }
-        ui.end_row();
-    }
-
-    fn shortcut(&self, action: ShortcutAction) -> KeyBinding {
-        match action {
-            ShortcutAction::EditorPage => self.editor_shortcut,
-            ShortcutAction::DiffPage => self.diff_shortcut,
-        }
-    }
-
-    fn set_shortcut(&mut self, action: ShortcutAction, binding: KeyBinding) {
-        match action {
-            ShortcutAction::EditorPage => self.editor_shortcut = binding,
-            ShortcutAction::DiffPage => self.diff_shortcut = binding,
-        }
-    }
-
-    fn capture_recorded_shortcut(&mut self, ctx: &Context) {
-        let Some(action) = self.recording else {
-            return;
-        };
-
-        let events = ctx.input(|i| i.events.clone());
-        for event in events {
-            if let egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } = event
-            {
-                if key == Key::Escape {
-                    self.recording = None;
-                    return;
-                }
-                let normalized = Modifiers {
-                    alt: modifiers.alt,
-                    ctrl: modifiers.ctrl,
-                    shift: modifiers.shift,
-                    mac_cmd: false,
-                    command: modifiers.command,
-                };
-                self.set_shortcut(action, KeyBinding::new(key, normalized));
-                self.recording = None;
-                return;
-            }
-        }
     }
 }
 
@@ -397,61 +262,4 @@ fn settings_section(ui: &mut egui::Ui, title: &str) {
     ui.label(egui::RichText::new(title).strong());
     ui.separator();
     ui.add_space(6.0);
-}
-
-fn key_label(key: Key) -> &'static str {
-    match key {
-        Key::ArrowDown => "Down",
-        Key::ArrowLeft => "Left",
-        Key::ArrowRight => "Right",
-        Key::ArrowUp => "Up",
-        Key::Escape => "Esc",
-        Key::Tab => "Tab",
-        Key::Backspace => "Backspace",
-        Key::Enter => "Enter",
-        Key::Space => "Space",
-        Key::Insert => "Insert",
-        Key::Delete => "Delete",
-        Key::Home => "Home",
-        Key::End => "End",
-        Key::PageUp => "PageUp",
-        Key::PageDown => "PageDown",
-        Key::Num0 => "0",
-        Key::Num1 => "1",
-        Key::Num2 => "2",
-        Key::Num3 => "3",
-        Key::Num4 => "4",
-        Key::Num5 => "5",
-        Key::Num6 => "6",
-        Key::Num7 => "7",
-        Key::Num8 => "8",
-        Key::Num9 => "9",
-        Key::A => "A",
-        Key::B => "B",
-        Key::C => "C",
-        Key::D => "D",
-        Key::E => "E",
-        Key::F => "F",
-        Key::G => "G",
-        Key::H => "H",
-        Key::I => "I",
-        Key::J => "J",
-        Key::K => "K",
-        Key::L => "L",
-        Key::M => "M",
-        Key::N => "N",
-        Key::O => "O",
-        Key::P => "P",
-        Key::Q => "Q",
-        Key::R => "R",
-        Key::S => "S",
-        Key::T => "T",
-        Key::U => "U",
-        Key::V => "V",
-        Key::W => "W",
-        Key::X => "X",
-        Key::Y => "Y",
-        Key::Z => "Z",
-        _ => "?",
-    }
 }

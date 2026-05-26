@@ -10,10 +10,42 @@ const ROW_H: f32 = 24.0;
 const INDENT: f32 = 14.0;
 const LEFT_PAD: f32 = 8.0;
 
-/// Render the tree rooted at `root`. Returns the path of a file clicked this
-/// frame, if any.
-pub fn show(ui: &mut egui::Ui, root: &Path, selected: Option<&Path>) -> Option<PathBuf> {
-    let mut clicked = None;
+/// A context-menu action requested on a tree node, handled by the app.
+pub enum TreeAction {
+    NewFile(PathBuf),
+    NewFolder(PathBuf),
+    Rename(PathBuf),
+    Delete(PathBuf),
+    Duplicate(PathBuf),
+    CopyFile(PathBuf),
+    Paste(PathBuf),
+    RevealInFinder(PathBuf),
+    OpenInTerminal(PathBuf),
+    CopyPath(PathBuf),
+    CopyRelativePath(PathBuf),
+}
+
+struct TreeCtx<'a> {
+    selected: Option<&'a Path>,
+    can_paste: bool,
+    clicked: Option<PathBuf>,
+    action: Option<TreeAction>,
+}
+
+/// Render the tree rooted at `root`. Returns `(clicked_file, context_action)`
+/// requested this frame.
+pub fn show(
+    ui: &mut egui::Ui,
+    root: &Path,
+    selected: Option<&Path>,
+    can_paste: bool,
+) -> (Option<PathBuf>, Option<TreeAction>) {
+    let mut ctx = TreeCtx {
+        selected,
+        can_paste,
+        clicked: None,
+        action: None,
+    };
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -21,21 +53,15 @@ pub fn show(ui: &mut egui::Ui, root: &Path, selected: Option<&Path>) -> Option<P
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| root.to_string_lossy().into_owned());
-            let open = tree_row(ui, root, &name, true, true, false, 0);
+            let open = tree_row(ui, root, &name, true, true, false, 0, &mut ctx);
             if open {
-                dir_contents(ui, root, selected, &mut clicked, 1);
+                dir_contents(ui, root, 1, &mut ctx);
             }
         });
-    clicked
+    (ctx.clicked, ctx.action)
 }
 
-fn dir_contents(
-    ui: &mut egui::Ui,
-    dir: &Path,
-    selected: Option<&Path>,
-    clicked: &mut Option<PathBuf>,
-    depth: usize,
-) {
+fn dir_contents(ui: &mut egui::Ui, dir: &Path, depth: usize, ctx: &mut TreeCtx) {
     let entries = match read_sorted(dir) {
         Ok(e) => e,
         Err(_) => {
@@ -46,20 +72,66 @@ fn dir_contents(
 
     for (path, name, is_dir) in entries {
         if is_dir {
-            let open = tree_row(ui, &path, &name, true, false, false, depth);
+            let open = tree_row(ui, &path, &name, true, false, false, depth, ctx);
             if open {
-                dir_contents(ui, &path, selected, clicked, depth + 1);
+                dir_contents(ui, &path, depth + 1, ctx);
             }
         } else {
-            let is_sel = selected == Some(path.as_path());
+            let is_sel = ctx.selected == Some(path.as_path());
             let response = tree_file_row(ui, &path, &name, is_sel, depth);
             if response.clicked() {
-                *clicked = Some(path.clone());
+                ctx.clicked = Some(path.clone());
             }
+            attach_menu(&response, &path, false, ctx.can_paste, &mut ctx.action);
         }
     }
 }
 
+/// Right-click context menu for a tree node. `is_dir` selects whether "new"
+/// and "paste" target this node or its parent directory.
+fn attach_menu(
+    response: &egui::Response,
+    path: &Path,
+    is_dir: bool,
+    can_paste: bool,
+    action: &mut Option<TreeAction>,
+) {
+    let dir = if is_dir {
+        path.to_path_buf()
+    } else {
+        path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf())
+    };
+    fn item(ui: &mut egui::Ui, label: &str, act: TreeAction, out: &mut Option<TreeAction>) {
+        if ui.button(label).clicked() {
+            *out = Some(act);
+            ui.close_menu();
+        }
+    }
+    response.context_menu(|ui| {
+        item(ui, "New File…", TreeAction::NewFile(dir.clone()), action);
+        item(ui, "New Folder…", TreeAction::NewFolder(dir.clone()), action);
+        ui.separator();
+        item(ui, "Rename…", TreeAction::Rename(path.to_path_buf()), action);
+        item(ui, "Duplicate", TreeAction::Duplicate(path.to_path_buf()), action);
+        item(ui, "Move to Trash", TreeAction::Delete(path.to_path_buf()), action);
+        ui.separator();
+        item(ui, "Copy", TreeAction::CopyFile(path.to_path_buf()), action);
+        ui.add_enabled_ui(can_paste, |ui| {
+            if ui.button("Paste").clicked() {
+                *action = Some(TreeAction::Paste(dir.clone()));
+                ui.close_menu();
+            }
+        });
+        ui.separator();
+        item(ui, "Reveal in Finder", TreeAction::RevealInFinder(path.to_path_buf()), action);
+        item(ui, "Open in Terminal", TreeAction::OpenInTerminal(dir.clone()), action);
+        ui.separator();
+        item(ui, "Copy Path", TreeAction::CopyPath(path.to_path_buf()), action);
+        item(ui, "Copy Relative Path", TreeAction::CopyRelativePath(path.to_path_buf()), action);
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn tree_row(
     ui: &mut egui::Ui,
     path: &Path,
@@ -68,6 +140,7 @@ fn tree_row(
     default_open: bool,
     selected: bool,
     depth: usize,
+    ctx: &mut TreeCtx,
 ) -> bool {
     let id = ui.id().with(path);
     let mut open = ui
@@ -75,6 +148,7 @@ fn tree_row(
         .data_mut(|d| d.get_persisted::<bool>(id).unwrap_or(default_open));
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
+    attach_menu(&response, path, is_dir, ctx.can_paste, &mut ctx.action);
     paint_row_bg(ui, rect, selected, response.hovered());
 
     let x = rect.left() + LEFT_PAD + depth as f32 * INDENT;

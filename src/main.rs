@@ -1,13 +1,17 @@
 // Diffist — a fast, native (wgpu/Metal) git diff viewer for macOS.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod app;
 mod editor;
 mod fstree;
 mod gitmodel;
 mod highlight;
 mod menu;
+mod palette;
+mod search;
 mod settings;
+mod terminal;
 mod textview;
 mod theme;
 

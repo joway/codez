@@ -68,6 +68,33 @@ enum EditKind {
     Hard,
 }
 
+/// Find/replace state for the current file.
+struct Search {
+    open: bool,
+    replace: bool,
+    query: String,
+    replacement: String,
+    matches: Vec<(usize, usize)>, // char ranges
+    current: Option<usize>,
+    needs_recompute: bool,
+    focus: bool,
+}
+
+impl Default for Search {
+    fn default() -> Self {
+        Self {
+            open: false,
+            replace: false,
+            query: String::new(),
+            replacement: String::new(),
+            matches: Vec::new(),
+            current: None,
+            needs_recompute: true,
+            focus: false,
+        }
+    }
+}
+
 pub struct Editor {
     rope: Rope,
     carets: Vec<Caret>,
@@ -86,6 +113,7 @@ pub struct Editor {
     redo: Vec<Snapshot>,
     last_kind: Option<EditKind>,
     saved_undo_len: usize,
+    search: Search,
 }
 
 /// Pointer state sampled once per frame (avoids per-row interactive widgets,
@@ -118,11 +146,26 @@ impl Editor {
             redo: Vec::new(),
             last_kind: None,
             saved_undo_len: 0,
+            search: Search::default(),
         })
     }
 
     pub fn is_dirty(&self) -> bool {
         self.undo.len() != self.saved_undo_len
+    }
+
+    /// Select the matched range at `line`/`col` and scroll it into view
+    /// (used when jumping from a Find-in-Files result).
+    pub fn reveal_match(&mut self, line: usize, col: usize, len: usize) {
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        let start = (self.rope.line_to_char(line) + col).min(self.rope.len_chars());
+        let end = (start + len).min(self.rope.len_chars());
+        self.carets = vec![Caret {
+            anchor: start,
+            head: end,
+            goal_col: None,
+        }];
+        self.pending_scroll_to = Some(start);
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -231,6 +274,7 @@ impl Editor {
         }
         self.redo.clear();
         self.last_kind = Some(kind);
+        self.search.needs_recompute = true;
     }
 
     fn undo(&mut self) {
@@ -299,9 +343,18 @@ impl Editor {
                 self.carets[i] = Caret::point(a);
                 shift -= (b - a) as isize;
             } else if a > 0 {
-                self.rope.remove(a - 1..a);
-                self.carets[i] = Caret::point(a - 1);
-                shift -= 1;
+                let prev = self.rope.char(a - 1);
+                let pair = a < self.rope.len_chars()
+                    && matching_close(prev) == Some(self.rope.char(a));
+                if pair {
+                    self.rope.remove(a - 1..a + 1);
+                    self.carets[i] = Caret::point(a - 1);
+                    shift -= 2;
+                } else {
+                    self.rope.remove(a - 1..a);
+                    self.carets[i] = Caret::point(a - 1);
+                    shift -= 1;
+                }
             } else {
                 self.carets[i] = Caret::point(a);
             }
@@ -332,6 +385,134 @@ impl Editor {
                 }
             }
             self.carets[i] = Caret::point(a);
+        }
+        self.dirty = true;
+        self.normalize();
+    }
+
+    /// Route typed text: single bracket/quote chars get auto-pairing, the rest
+    /// is a plain insert.
+    fn type_text(&mut self, t: &str) {
+        let mut chars = t.chars();
+        let (first, second) = (chars.next(), chars.next());
+        if let (Some(c), None) = (first, second) {
+            if matching_close(c).is_some() {
+                self.type_open(c);
+                return;
+            }
+            if is_closer(c) {
+                self.type_close(c);
+                return;
+            }
+        }
+        self.insert(t);
+    }
+
+    /// Type an opener (or quote): wrap a selection, over-type a matching quote,
+    /// otherwise insert the pair and place the caret between.
+    fn type_open(&mut self, open: char) {
+        let close = matching_close(open).unwrap_or(open);
+
+        // Quote over-type: typing " just before an existing " steps over it.
+        if open == close
+            && self.carets.iter().all(|c| {
+                c.is_empty() && c.head < self.rope.len_chars() && self.rope.char(c.head) == open
+            })
+        {
+            self.last_kind = None;
+            for i in 0..self.carets.len() {
+                let h = self.carets[i].head + 1;
+                self.carets[i] = Caret::point(h);
+            }
+            self.normalize();
+            return;
+        }
+
+        self.begin_edit(EditKind::Hard);
+        let mut order: Vec<usize> = (0..self.carets.len()).collect();
+        order.sort_by_key(|&i| self.carets[i].min());
+        let mut shift: isize = 0;
+        for &i in &order {
+            let a = (self.carets[i].min() as isize + shift) as usize;
+            let b = (self.carets[i].max() as isize + shift) as usize;
+            if b > a {
+                // Wrap the selection, preserving its direction.
+                self.rope.insert(b, &close.to_string());
+                self.rope.insert(a, &open.to_string());
+                let forward = self.carets[i].head >= self.carets[i].anchor;
+                self.carets[i] = if forward {
+                    Caret { anchor: a + 1, head: b + 1, goal_col: None }
+                } else {
+                    Caret { anchor: b + 1, head: a + 1, goal_col: None }
+                };
+            } else {
+                self.rope.insert(a, &format!("{open}{close}"));
+                self.carets[i] = Caret::point(a + 1);
+            }
+            shift += 2;
+        }
+        self.dirty = true;
+        self.normalize();
+    }
+
+    /// Type a closer: step over an existing matching closer, else insert it.
+    fn type_close(&mut self, close: char) {
+        let over = self.carets.iter().all(|c| {
+            c.is_empty() && c.head < self.rope.len_chars() && self.rope.char(c.head) == close
+        });
+        if over && !self.carets.is_empty() {
+            self.last_kind = None;
+            for i in 0..self.carets.len() {
+                let h = self.carets[i].head + 1;
+                self.carets[i] = Caret::point(h);
+            }
+            self.normalize();
+        } else {
+            self.insert(&close.to_string());
+        }
+    }
+
+    /// Newline that inherits the current line's indent, adding one level when
+    /// splitting an empty bracket pair `{|}`.
+    fn newline_smart(&mut self) {
+        self.begin_edit(EditKind::Hard);
+        let mut order: Vec<usize> = (0..self.carets.len()).collect();
+        order.sort_by_key(|&i| self.carets[i].min());
+        let mut shift: isize = 0;
+        for &i in &order {
+            let a = (self.carets[i].min() as isize + shift) as usize;
+            let b = (self.carets[i].max() as isize + shift) as usize;
+            if b > a {
+                self.rope.remove(a..b);
+            }
+            let line = self.rope.char_to_line(a);
+            let indent: String = self
+                .rope
+                .line(line)
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            let before = (a > 0).then(|| self.rope.char(a - 1));
+            let after = (a < self.rope.len_chars()).then(|| self.rope.char(a));
+            let expand = matches!(
+                (before, after),
+                (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+            );
+            let inner = format!("{indent}    ");
+            let text = if expand {
+                format!("\n{inner}\n{indent}")
+            } else {
+                format!("\n{indent}")
+            };
+            let n = text.chars().count();
+            self.rope.insert(a, &text);
+            let caret = if expand {
+                a + 1 + inner.chars().count()
+            } else {
+                a + n
+            };
+            self.carets[i] = Caret::point(caret);
+            shift += n as isize - (b - a) as isize;
         }
         self.dirty = true;
         self.normalize();
@@ -869,6 +1050,195 @@ impl Editor {
         ctx.copy_text(text);
     }
 
+    // ---- find / replace ----
+
+    fn open_find(&mut self, replace: bool) {
+        self.search.open = true;
+        self.search.replace = replace;
+        self.search.focus = true;
+        if let Some(sel) = self.selected_text() {
+            self.search.query = sel;
+        }
+        self.search.needs_recompute = true;
+    }
+
+    fn recompute_matches(&mut self) {
+        self.search.needs_recompute = false;
+        self.search.matches.clear();
+        let q: Vec<char> = self.search.query.chars().collect();
+        if q.is_empty() {
+            self.search.current = None;
+            return;
+        }
+        let lc = |c: char| c.to_lowercase().next().unwrap_or(c);
+        let ql: Vec<char> = q.iter().map(|&c| lc(c)).collect();
+        let text: Vec<char> = self.rope.chars().collect();
+        let mut i = 0;
+        while i + ql.len() <= text.len() {
+            if (0..ql.len()).all(|k| lc(text[i + k]) == ql[k]) {
+                self.search.matches.push((i, i + ql.len()));
+                i += ql.len();
+            } else {
+                i += 1;
+            }
+        }
+        let caret = self.carets.last().map(Caret::min).unwrap_or(0);
+        self.search.current = self
+            .search
+            .matches
+            .iter()
+            .position(|&(s, _)| s >= caret)
+            .or(if self.search.matches.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+    }
+
+    fn goto_current(&mut self) {
+        if let Some(&(s, e)) = self.search.current.and_then(|c| self.search.matches.get(c)) {
+            self.carets = vec![Caret {
+                anchor: s,
+                head: e,
+                goal_col: None,
+            }];
+            self.pending_scroll_to = Some(s);
+        }
+    }
+
+    fn find_next(&mut self) {
+        if self.search.needs_recompute {
+            self.recompute_matches();
+        }
+        let n = self.search.matches.len();
+        if n == 0 {
+            return;
+        }
+        self.search.current = Some(self.search.current.map_or(0, |c| (c + 1) % n));
+        self.goto_current();
+    }
+
+    fn find_prev(&mut self) {
+        if self.search.needs_recompute {
+            self.recompute_matches();
+        }
+        let n = self.search.matches.len();
+        if n == 0 {
+            return;
+        }
+        self.search.current = Some(self.search.current.map_or(0, |c| (c + n - 1) % n));
+        self.goto_current();
+    }
+
+    fn replace_current(&mut self) {
+        if self.search.needs_recompute {
+            self.recompute_matches();
+        }
+        let Some(&(s, e)) = self.search.current.and_then(|c| self.search.matches.get(c)) else {
+            return;
+        };
+        self.begin_edit(EditKind::Hard);
+        self.rope.remove(s..e);
+        let repl = self.search.replacement.clone();
+        self.rope.insert(s, &repl);
+        self.dirty = true;
+        let after = s + repl.chars().count();
+        self.carets = vec![Caret::point(after)];
+        self.recompute_matches();
+        self.search.current = self.search.matches.iter().position(|&(ms, _)| ms >= after);
+        self.goto_current();
+    }
+
+    fn replace_all(&mut self) {
+        if self.search.needs_recompute {
+            self.recompute_matches();
+        }
+        if self.search.matches.is_empty() {
+            return;
+        }
+        self.begin_edit(EditKind::Hard);
+        let repl = self.search.replacement.clone();
+        for &(s, e) in self.search.matches.clone().iter().rev() {
+            self.rope.remove(s..e);
+            self.rope.insert(s, &repl);
+        }
+        self.dirty = true;
+        self.carets = vec![Caret::point(0)];
+        self.recompute_matches();
+    }
+
+    /// The find/replace bar, drawn at the top of the editor area when open.
+    fn draw_find_bar(&mut self, ui: &mut egui::Ui) {
+        if self.search.needs_recompute {
+            self.recompute_matches();
+        }
+        let mut close = false;
+        egui::Frame::none()
+            .fill(theme::SURFACE)
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search.query)
+                            .hint_text("Find")
+                            .desired_width(240.0),
+                    );
+                    if self.search.focus {
+                        resp.request_focus();
+                        self.search.focus = false;
+                    }
+                    if resp.changed() {
+                        self.recompute_matches();
+                    }
+                    let count = if self.search.matches.is_empty() {
+                        "0/0".to_string()
+                    } else {
+                        format!(
+                            "{}/{}",
+                            self.search.current.map_or(0, |c| c + 1),
+                            self.search.matches.len()
+                        )
+                    };
+                    ui.label(egui::RichText::new(count).color(theme::TEXT_DIM));
+                    if ui.button("‹").on_hover_text("Previous (⇧⌘G)").clicked() {
+                        self.find_prev();
+                    }
+                    if ui.button("›").on_hover_text("Next (⌘G)").clicked() {
+                        self.find_next();
+                    }
+                    if ui.button("✕").clicked() {
+                        close = true;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.find_next();
+                        self.search.focus = true;
+                    }
+                });
+                if self.search.replace {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search.replacement)
+                                .hint_text("Replace")
+                                .desired_width(240.0),
+                        );
+                        if ui.button("Replace").clicked() {
+                            self.replace_current();
+                        }
+                        if ui.button("All").clicked() {
+                            self.replace_all();
+                        }
+                    });
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if close {
+            self.search.open = false;
+        }
+        ui.separator();
+    }
+
     /// Sort carets and merge overlapping/duplicate ones, keeping ≥1.
     fn normalize(&mut self) {
         self.carets.sort_by_key(|c| (c.min(), c.max()));
@@ -905,7 +1275,7 @@ impl Editor {
         let events = ctx.input(|i| i.events.clone());
         for ev in events {
             match ev {
-                egui::Event::Text(t) if !t.is_empty() => self.insert(&t),
+                egui::Event::Text(t) if !t.is_empty() => self.type_text(&t),
                 // CJK / IME input arrives here, not as `Text`.
                 egui::Event::Ime(ime) => match ime {
                     egui::ImeEvent::Preedit(t) => self.preedit = t,
@@ -948,9 +1318,13 @@ impl Editor {
                         L if modifiers.command => self.select_lines(),
                         Slash if modifiers.command => self.toggle_line_comment(),
                         A if modifiers.command => self.select_all(),
+                        F if modifiers.command && modifiers.alt => self.open_find(true),
+                        F if modifiers.command => self.open_find(false),
+                        G if modifiers.command && modifiers.shift => self.find_prev(),
+                        G if modifiers.command => self.find_next(),
                         Enter if modifiers.command && modifiers.shift => self.insert_line_before(),
                         Enter if modifiers.command => self.insert_line_after(),
-                        Enter => self.insert("\n"),
+                        Enter => self.newline_smart(),
                         Backspace if modifiers.command => self.delete_to_line_start(),
                         Backspace => self.backspace(),
                         Delete => self.delete_forward(),
@@ -1023,6 +1397,10 @@ impl Editor {
         let editor_active = !ui.ctx().wants_keyboard_input();
         if editor_active {
             self.handle_keys(ui.ctx());
+        }
+
+        if self.search.open {
+            self.draw_find_bar(ui);
         }
 
         let p = ui.ctx().input(|i| Pointer {
@@ -1123,6 +1501,32 @@ impl Editor {
                     );
                 }
 
+                // Find-match highlights (queries never contain newlines).
+                if view.search.open {
+                    for (mi, &(ms, me)) in view.search.matches.iter().enumerate() {
+                        if ms < line_start || ms >= line_start + llen + 1 {
+                            continue;
+                        }
+                        let sc = ms - line_start;
+                        let ec = (me - line_start).min(llen);
+                        let x0 = text_origin.x + col_x(&galley, sc.min(llen));
+                        let x1 = text_origin.x + col_x(&galley, ec);
+                        let color = if Some(mi) == view.search.current {
+                            Color32::from_rgb(0x6b, 0x52, 0x1c)
+                        } else {
+                            Color32::from_rgb(0x3d, 0x35, 0x16)
+                        };
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(x0, rect.top()),
+                                Pos2::new(x1, rect.bottom()),
+                            ),
+                            2.0,
+                            color,
+                        );
+                    }
+                }
+
                 painter.galley(text_origin, galley.clone(), theme::TEXT);
 
                 // Carets on this line.
@@ -1208,6 +1612,23 @@ fn col_x(galley: &egui::Galley, col: usize) -> f32 {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Openers that auto-insert a closer. Single quote `'` is excluded so it
+/// doesn't fight Rust lifetimes / char literals.
+fn matching_close(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+fn is_closer(c: char) -> bool {
+    matches!(c, ')' | ']' | '}')
 }
 
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
