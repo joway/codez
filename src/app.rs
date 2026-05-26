@@ -28,7 +28,7 @@ enum DiffSidebarTab {
     Commits,
 }
 
-pub struct DiffistApp {
+pub struct CodezApp {
     mode: Mode,
     root: Option<PathBuf>,
 
@@ -81,6 +81,8 @@ pub struct DiffistApp {
     terminal: Option<Terminal>,
     agent_status: String,
     agent_scan_at: std::time::Instant,
+    /// Last time the Diff page re-probed a non-git folder for a new repo.
+    git_recheck_at: std::time::Instant,
 }
 
 /// A pending file-tree text prompt (modal naming dialog).
@@ -91,13 +93,13 @@ enum FilePrompt {
     Rename(PathBuf),
 }
 
-impl DiffistApp {
+impl CodezApp {
     /// Build the app (installing the native menu bar), optionally opening
     /// `initial_dir` on startup. Must run on the main thread after the
     /// NSApplication exists, i.e. from eframe's creation closure.
     pub fn new(initial_dir: Option<PathBuf>, initial_file: Option<PathBuf>) -> Self {
         // Optional override so the app can launch straight into Diff mode.
-        let mode = match std::env::var("DIFFIST_MODE").as_deref() {
+        let mode = match std::env::var("CODEZ_MODE").as_deref() {
             Ok("diff") => Mode::GitDiff,
             _ => Mode::FileBrowser,
         };
@@ -139,6 +141,7 @@ impl DiffistApp {
             terminal: None,
             agent_status: String::new(),
             agent_scan_at: std::time::Instant::now(),
+            git_recheck_at: std::time::Instant::now(),
         };
         if let Some(dir) = initial_dir {
             app.open_folder(&dir);
@@ -150,7 +153,7 @@ impl DiffistApp {
     }
 }
 
-impl eframe::App for DiffistApp {
+impl eframe::App for CodezApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_menu();
         // View switching is via the native View menu: ⌘1 Editor / ⌘2 Diff / ⌘3 Agent.
@@ -198,7 +201,7 @@ impl eframe::App for DiffistApp {
     }
 }
 
-impl DiffistApp {
+impl CodezApp {
     /// Top strip: folder name on the left, Editor/Diff segmented switch on the
     /// right (the rest of the menu lives in the native macOS menu bar).
     fn mode_bar(&mut self, ctx: &egui::Context) {
@@ -207,13 +210,14 @@ impl DiffistApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(PANEL_LEFT_PAD);
-                    ui.label(RichText::new("Diffist").color(theme::TEXT_DIM).strong());
+                    ui.label(RichText::new("CodeZ").color(theme::TEXT_DIM).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(4.0);
-                        // Right-to-left: "Agent" hugs the corner, then Diff, then Editor.
-                        ui.selectable_value(&mut self.mode, Mode::Agent, "  Agent  ");
+                        // Right-to-left add order yields a left-to-right visual
+                        // order of Agent / Editor / Diff.
                         ui.selectable_value(&mut self.mode, Mode::GitDiff, "  Diff  ");
                         ui.selectable_value(&mut self.mode, Mode::FileBrowser, "  Editor  ");
+                        ui.selectable_value(&mut self.mode, Mode::Agent, "  Agent  ");
                     });
                 });
             });
@@ -276,7 +280,19 @@ impl DiffistApp {
         self.agent_status.clear();
         self.sessions = agent::scan(dir);
 
-        match Repository::discover(dir) {
+        self.git_recheck_at = std::time::Instant::now();
+        self.load_git_state();
+    }
+
+    /// Discover a git repo at the current `root` and load its diff state
+    /// (local changes + commit history). Used both when opening a folder and
+    /// when the Diff page re-probes a folder that wasn't a repo before.
+    /// Returns true once a repository is open.
+    fn load_git_state(&mut self) -> bool {
+        let Some(root) = self.root.clone() else {
+            return false;
+        };
+        match Repository::discover(&root) {
             Ok(repo) => {
                 match gitmodel::workdir_changes(&repo) {
                     Ok(changes) => {
@@ -298,8 +314,12 @@ impl DiffistApp {
                     }
                     Err(e) => self.git_status = format!("git error: {e}"),
                 }
+                true
             }
-            Err(_) => self.git_status = "not a git repository".to_string(),
+            Err(_) => {
+                self.git_status = "not a git repository".to_string();
+                false
+            }
         }
     }
 
@@ -711,6 +731,20 @@ impl DiffistApp {
     // ---------------- Git Diff mode ----------------
 
     fn git_diff_ui(&mut self, ctx: &egui::Context) {
+        // If the folder wasn't a git repo when opened, keep watching it: the
+        // moment `git init` (or a clone/checkout) turns it into one, load the
+        // repo and re-render. We only poll while no repo is open, so this never
+        // disturbs in-progress selections, and `request_repaint_after` keeps
+        // the poll ticking even when the UI is otherwise idle.
+        if self.repo.is_none() && self.root.is_some() {
+            let interval = std::time::Duration::from_millis(1200);
+            if self.git_recheck_at.elapsed() >= interval {
+                self.git_recheck_at = std::time::Instant::now();
+                self.load_git_state();
+            }
+            ctx.request_repaint_after(interval);
+        }
+
         // Collect a finished background push, if any.
         if let Some(rx) = &self.push_rx {
             if let Ok(result) = rx.try_recv() {
@@ -1326,7 +1360,7 @@ fn paint_checkbox(ui: &egui::Ui, rect: Rect, checked: bool, hovered: bool) {
     }
 }
 
-fn commit_panel(ui: &mut egui::Ui, app: &mut DiffistApp) {
+fn commit_panel(ui: &mut egui::Ui, app: &mut CodezApp) {
     ui.add_space(10.0);
     ui.separator();
     ui.add_space(10.0);
@@ -1345,7 +1379,7 @@ fn commit_panel(ui: &mut egui::Ui, app: &mut DiffistApp) {
         ui.add_sized(
             Vec2::new(width, 30.0),
             egui::TextEdit::singleline(&mut app.commit_summary)
-                .hint_text("Summary")
+                .hint_text(RichText::new("Summary").color(theme::TEXT_MUTED))
                 .desired_width(width),
         );
     });

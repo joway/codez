@@ -1,5 +1,5 @@
 [package]
-name = "diffist"
+name = "codez"
 version = "0.1.0"
 edition = "2021"
 description = "A fast, native git diff viewer for macOS"

@@ -1,0 +1,32 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262d39"/>
+      <stop offset="0.55" stop-color="#161b22"/>
+      <stop offset="1" stop-color="#0d1117"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="0.35" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#bg)"/>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#sheen)"/>
+  <rect x="33.5" y="33.5" width="957" height="957" rx="222.5" fill="none" stroke="#3a4150" stroke-width="3"/>
+
+  <g filter="url(#shadow)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- code angle brackets framing the Z -->
+    <path d="M 300 380 L 212 512 L 300 644" stroke="#586069" stroke-width="60"/>
+    <path d="M 724 380 L 812 512 L 724 644" stroke="#586069" stroke-width="60"/>
+    <!-- monochrome Z: tonal top->bottom keeps the diff "stripe" feel without color -->
+    <g stroke-width="92">
+      <path d="M 396 384 L 628 384 L 396 640 L 628 640" stroke="#c9d1d9"/>
+      <path d="M 396 384 L 628 384" stroke="#f0f3f6"/>
+      <path d="M 396 640 L 628 640" stroke="#8b949e"/>
+    </g>
+  </g>
+</svg>

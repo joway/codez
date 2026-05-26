@@ -50,7 +50,7 @@ pub fn commit_paths(
 ) -> Result<Oid, git2::Error> {
     let signature = repo
         .signature()
-        .or_else(|_| Signature::now("Diffist", "diffist@local"))?;
+        .or_else(|_| Signature::now("CodeZ", "codez@local"))?;
     let head_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
     let mut index = repo.index()?;
 

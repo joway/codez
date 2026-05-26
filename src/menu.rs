@@ -26,14 +26,14 @@ impl Menus {
     pub fn install() -> Menus {
         let menu = Menu::new();
 
-        let app_menu = Submenu::new("Diffist", true);
+        let app_menu = Submenu::new("CodeZ", true);
         let settings = MenuItem::new(
             "Settings…",
             true,
             Some(Accelerator::new(Some(Modifiers::SUPER), Code::Comma)),
         );
         let _ = app_menu.append_items(&[
-            &PredefinedMenuItem::about(Some("About Diffist"), None),
+            &PredefinedMenuItem::about(Some("About CodeZ"), None),
             &PredefinedMenuItem::separator(),
             &settings,
             &PredefinedMenuItem::separator(),
@@ -54,22 +54,22 @@ impl Menus {
         let _ = file_menu.append_items(&[&open, &save]);
 
         let view_menu = Submenu::new("View", true);
+        let agent = MenuItem::new(
+            "Agent",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit1)),
+        );
         let editor = MenuItem::new(
             "Editor",
             true,
-            Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit1)),
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit2)),
         );
         let diff = MenuItem::new(
             "Diff",
             true,
-            Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit2)),
-        );
-        let agent = MenuItem::new(
-            "Agent",
-            true,
             Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit3)),
         );
-        let _ = view_menu.append_items(&[&editor, &diff, &agent]);
+        let _ = view_menu.append_items(&[&agent, &editor, &diff]);
 
         let _ = menu.append_items(&[&app_menu, &file_menu, &view_menu]);
 

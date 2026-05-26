@@ -1,4 +1,4 @@
-// Diffist — a fast, native (wgpu/Metal) git diff viewer for macOS.
+// CodeZ — a fast, native (wgpu/Metal) git diff viewer for macOS.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
@@ -17,7 +17,7 @@ mod theme;
 
 use std::path::PathBuf;
 
-use app::DiffistApp;
+use app::CodezApp;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -41,7 +41,7 @@ fn main() -> eframe::Result<()> {
             #[cfg(target_os = "macos")]
             force_dark_window_chrome();
             // Fonts (incl. CJK fallback) are installed by Settings on first frame.
-            Ok(Box::new(DiffistApp::new(dir, file)))
+            Ok(Box::new(CodezApp::new(dir, file)))
         }),
     )
 }

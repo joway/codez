@@ -73,6 +73,8 @@ pub struct Terminal {
     lines: u16,
     cell: Vec2,
     needs_focus: bool,
+    /// Sub-line trackpad scroll remainder (pixels), accumulated across frames.
+    scroll_accum: f32,
 }
 
 impl Terminal {
@@ -121,7 +123,7 @@ impl Terminal {
         let exited_thread = exited.clone();
         let ctx = ctx.clone();
         std::thread::Builder::new()
-            .name(format!("diffist-pty-{id}"))
+            .name(format!("codez-pty-{id}"))
             .spawn(move || {
                 while let Ok(event) = event_rx.recv() {
                     ctx.request_repaint();
@@ -151,6 +153,7 @@ impl Terminal {
             lines,
             cell: Vec2::new(cell_w as f32, cell_h as f32),
             needs_focus: true,
+            scroll_accum: 0.0,
         })
     }
 
@@ -169,6 +172,12 @@ impl Terminal {
         let rect = response.rect;
 
         self.resize(rect.size(), cell);
+
+        // Mouse-wheel / trackpad scrolling through the scrollback works whenever
+        // the pointer is over the pane, even without keyboard focus.
+        if response.hovered() || response.has_focus() {
+            self.process_scroll(ui);
+        }
 
         if self.needs_focus || response.clicked() {
             response.request_focus();
@@ -235,16 +244,79 @@ impl Terminal {
         Rect::from_min_size(Pos2::new(x, y), cell)
     }
 
+    /// Translate wheel/trackpad events into scrollback movement.
+    fn process_scroll(&mut self, ui: &Ui) {
+        let mut lines = 0i32;
+        for event in ui.input(|i| i.events.clone()) {
+            if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                match unit {
+                    egui::MouseWheelUnit::Line => {
+                        lines += (delta.y.signum() * delta.y.abs().ceil()) as i32;
+                    }
+                    egui::MouseWheelUnit::Point => {
+                        self.scroll_accum -= delta.y;
+                        let whole = (self.scroll_accum / self.cell.y).trunc();
+                        self.scroll_accum %= self.cell.y;
+                        lines -= whole as i32;
+                    }
+                    egui::MouseWheelUnit::Page => {}
+                }
+            }
+        }
+        if lines != 0 {
+            self.scroll(lines);
+        }
+    }
+
+    /// Scroll the display by `lines` (positive = toward older output). In a
+    /// full-screen app's alternate scroll mode there is no scrollback, so
+    /// translate the wheel into arrow keys the way xterm does.
+    fn scroll(&mut self, lines: i32) {
+        let mut term = self.term.lock();
+        if term
+            .mode()
+            .contains(TermMode::ALTERNATE_SCROLL | TermMode::ALT_SCREEN)
+        {
+            let arrow = if lines > 0 { b'A' } else { b'B' };
+            let mut bytes = Vec::with_capacity(lines.unsigned_abs() as usize * 3);
+            for _ in 0..lines.abs() {
+                bytes.extend_from_slice(&[0x1b, b'O', arrow]);
+            }
+            drop(term);
+            self.notifier.notify(bytes);
+        } else {
+            term.grid_mut().scroll_display(Scroll::Delta(lines));
+        }
+    }
+
     fn process_input(&self, ui: &Ui) {
-        let app_cursor = self.term.lock().mode().contains(TermMode::APP_CURSOR);
+        let (app_cursor, bracketed_paste) = {
+            let mode = *self.term.lock().mode();
+            (
+                mode.contains(TermMode::APP_CURSOR),
+                mode.contains(TermMode::BRACKETED_PASTE),
+            )
+        };
         let mut out: Vec<u8> = Vec::new();
         for event in ui.input(|i| i.events.clone()) {
             match event {
                 // Printable text. Skip control chars — those arrive as Key
                 // events and we encode them ourselves (avoids double-sending
                 // Enter/Tab on platforms that emit both).
-                egui::Event::Text(t) | egui::Event::Paste(t) => {
+                egui::Event::Text(t) => {
                     if t.chars().all(|c| !c.is_control()) {
+                        out.extend_from_slice(t.as_bytes());
+                    }
+                }
+                // Clipboard paste: send verbatim (newlines and all). When the
+                // program enabled bracketed paste, wrap it so multi-line pastes
+                // arrive as one chunk instead of being run line by line.
+                egui::Event::Paste(t) => {
+                    if bracketed_paste {
+                        out.extend_from_slice(b"\x1b[200~");
+                        out.extend_from_slice(t.as_bytes());
+                        out.extend_from_slice(b"\x1b[201~");
+                    } else {
                         out.extend_from_slice(t.as_bytes());
                     }
                 }
