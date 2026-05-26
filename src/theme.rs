@@ -9,6 +9,9 @@ pub const SURFACE: Color32 = Color32::from_rgb(0x16, 0x1b, 0x22); // panels
 pub const INSET: Color32 = Color32::from_rgb(0x0d, 0x11, 0x17); // code background
 pub const RAISED: Color32 = Color32::from_rgb(0x21, 0x26, 0x2d); // buttons/hover
 pub const BORDER: Color32 = Color32::from_rgb(0x30, 0x36, 0x3d);
+pub const SIDEBAR: Color32 = Color32::from_rgb(0x1c, 0x21, 0x28);
+pub const SIDEBAR_HOVER: Color32 = Color32::from_rgb(0x26, 0x2c, 0x35);
+pub const SIDEBAR_SELECTED: Color32 = Color32::from_rgb(0x2d, 0x33, 0x3d);
 
 // --- Text -----------------------------------------------------------------
 pub const TEXT: Color32 = Color32::from_rgb(0xc9, 0xd1, 0xd9);

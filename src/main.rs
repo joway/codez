@@ -20,13 +20,13 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 480.0])
-            .with_title("Diffist"),
+            .with_title(""),
         ..Default::default()
     };
 
     let (dir, file) = startup_dir();
     eframe::run_native(
-        "Diffist",
+        "",
         options,
         Box::new(move |cc| {
             // Force the GitHub-flavored dark theme regardless of system appearance.

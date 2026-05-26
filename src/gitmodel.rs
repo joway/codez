@@ -1,7 +1,9 @@
 //! Thin wrappers over libgit2 (via the `git2` crate) for the data the Git Diff
 //! mode needs: commit history, per-commit file changes, and per-file patches.
 
-use git2::{Delta, DiffFormat, DiffOptions, Oid, Repository};
+use std::path::Path;
+
+use git2::{Delta, DiffFormat, DiffOptions, Index, Oid, Repository, Signature};
 
 pub struct CommitInfo {
     pub oid: Oid,
@@ -14,6 +16,83 @@ pub struct CommitInfo {
 pub struct FileChange {
     pub path: String,
     pub status: char,
+}
+
+/// List local working tree/index changes relative to HEAD.
+pub fn workdir_changes(repo: &Repository) -> Result<Vec<FileChange>, git2::Error> {
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_typechange(true);
+    let diff = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))?;
+
+    let mut out = Vec::new();
+    for delta in diff.deltas() {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        out.push(FileChange {
+            path,
+            status: status_char(delta.status()),
+        });
+    }
+    Ok(out)
+}
+
+pub fn commit_paths(
+    repo: &Repository,
+    paths: &[String],
+    message: &str,
+) -> Result<Oid, git2::Error> {
+    let signature = repo
+        .signature()
+        .or_else(|_| Signature::now("Diffist", "diffist@local"))?;
+    let head_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let mut index = repo.index()?;
+
+    if let Some(parent) = &head_commit {
+        let tree = parent.tree()?;
+        index.read_tree(&tree)?;
+    } else {
+        index = Index::new()?;
+    }
+
+    for path in paths {
+        let repo_path = Path::new(path);
+        if repo
+            .workdir()
+            .map(|root| root.join(repo_path).exists())
+            .unwrap_or(false)
+        {
+            index.add_path(repo_path)?;
+        } else {
+            let _ = index.remove_path(repo_path);
+        }
+    }
+
+    let tree_id = index.write_tree_to(repo)?;
+    let tree = repo.find_tree(tree_id)?;
+    let oid = match head_commit.as_ref() {
+        Some(parent) => repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[parent],
+        )?,
+        None => repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])?,
+    };
+
+    let mut real_index = repo.index()?;
+    real_index.read_tree(&tree)?;
+    real_index.write()?;
+
+    Ok(oid)
 }
 
 /// Walk history from HEAD (newest first), up to `max` commits.
@@ -85,6 +164,35 @@ pub fn file_patch(repo: &Repository, oid: Oid, path: &str) -> Result<String, git
     opts.context_lines(3);
     let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
 
+    let mut buf = String::new();
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        // For content lines (+/-/context) the origin marker is not part of
+        // `content`, so re-add it; header lines already contain their text.
+        match line.origin() {
+            '+' | '-' | ' ' => buf.push(line.origin()),
+            _ => {}
+        }
+        buf.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
+        true
+    })?;
+    Ok(buf)
+}
+
+/// Build a unified-diff patch string for a local working tree/index file.
+pub fn workdir_file_patch(repo: &Repository, path: &str) -> Result<String, git2::Error> {
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let mut opts = DiffOptions::new();
+    opts.pathspec(path)
+        .context_lines(3)
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_typechange(true);
+    let diff = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))?;
+
+    diff_to_patch(&diff)
+}
+
+fn diff_to_patch(diff: &git2::Diff<'_>) -> Result<String, git2::Error> {
     let mut buf = String::new();
     diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
         // For content lines (+/-/context) the origin marker is not part of

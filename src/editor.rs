@@ -5,10 +5,9 @@
 //! all of them — so multi-cursor is built in rather than bolted on. Rendering
 //! stays virtualized: only the visible rows are laid out and painted each frame.
 //!
-//! Implemented this phase: typing/IME, Enter/Backspace/Delete, arrow movement
-//! with Shift-selection, Home/End, click / Shift-click / Cmd-click (add caret) /
-//! drag-select, Cmd+A, copy/cut/paste, Esc to collapse. Deferred: undo/redo,
-//! Cmd+D (select next occurrence), word-wise motion.
+//! Implemented: typing/IME, Enter/Backspace/Delete, undo/redo, multi-caret
+//! selection/editing, Sublime-style Cmd+D next occurrence, line commands,
+//! indentation, word-wise motion, copy/cut/paste, and mouse selection.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -22,6 +21,7 @@ use crate::highlight::{self, Lang};
 use crate::theme;
 
 const CARET_COLOR: Color32 = Color32::from_rgb(0xe6, 0xed, 0xf3);
+const DOUBLE_CLICK_SECONDS: f64 = 0.35;
 
 /// One caret with an optional selection (`anchor != head`). Positions are char
 /// indices into the rope; `head` is the moving end.
@@ -35,7 +35,11 @@ struct Caret {
 
 impl Caret {
     fn point(p: usize) -> Self {
-        Caret { anchor: p, head: p, goal_col: None }
+        Caret {
+            anchor: p,
+            head: p,
+            goal_col: None,
+        }
     }
     fn min(&self) -> usize {
         self.anchor.min(self.head)
@@ -69,8 +73,15 @@ pub struct Editor {
     carets: Vec<Caret>,
     lang: Lang,
     path: PathBuf,
+    dirty: bool,
+    /// In-progress IME composition (CJK input), shown inline at the primary
+    /// caret until the input method commits it.
+    preedit: String,
     dragging: bool,
     drag: usize, // index of the caret being dragged
+    last_click_time: f64,
+    last_click_idx: Option<usize>,
+    pending_scroll_to: Option<usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last_kind: Option<EditKind>,
@@ -85,6 +96,7 @@ struct Pointer {
     down: bool,
     cmd: bool,
     shift: bool,
+    time: f64,
 }
 
 impl Editor {
@@ -96,18 +108,27 @@ impl Editor {
             lang: Lang::from_path(path),
             path: path.to_path_buf(),
             dirty: false,
+            preedit: String::new(),
             dragging: false,
             drag: 0,
+            last_click_time: f64::NEG_INFINITY,
+            last_click_idx: None,
+            pending_scroll_to: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_kind: None,
+            saved_undo_len: 0,
         })
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.undo.len() != self.saved_undo_len
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
         self.rope
             .write_to(BufWriter::new(File::create(&self.path)?))?;
+        self.saved_undo_len = self.undo.len();
         self.dirty = false;
         Ok(())
     }
@@ -116,7 +137,11 @@ impl Editor {
         let lines = self.rope.len_lines();
         let chars = self.rope.len_chars();
         let n = self.carets.len();
-        let cursors = if n > 1 { format!(" · {n} cursors") } else { String::new() };
+        let cursors = if n > 1 {
+            format!(" · {n} cursors")
+        } else {
+            String::new()
+        };
         format!("{lines} lines · {chars} chars{cursors}")
     }
 
@@ -152,10 +177,93 @@ impl Editor {
         self.rope.line_to_char(line) + col.min(self.line_len_chars(line))
     }
 
+    fn line_end_idx(&self, line: usize, include_newline: bool) -> usize {
+        let mut end = self.rope.line_to_char(line) + self.line_len_chars(line);
+        if include_newline && line + 1 < self.rope.len_lines() {
+            let next = self.rope.line_to_char(line + 1);
+            end = next;
+        }
+        end
+    }
+
+    fn selected_lines(&self) -> Vec<usize> {
+        let mut lines = Vec::new();
+        let last = self.rope.len_lines().saturating_sub(1);
+        for c in &self.carets {
+            let start = self.rope.char_to_line(c.min().min(self.rope.len_chars()));
+            let mut end_pos = c.max().min(self.rope.len_chars());
+            if !c.is_empty()
+                && end_pos > 0
+                && end_pos == self.rope.line_to_char(self.rope.char_to_line(end_pos))
+            {
+                end_pos -= 1;
+            }
+            let end = self.rope.char_to_line(end_pos).min(last);
+            for line in start..=end {
+                lines.push(line);
+            }
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    fn current_snapshot(&self) -> Snapshot {
+        Snapshot {
+            rope: self.rope.clone(),
+            carets: self.carets.clone(),
+        }
+    }
+
+    fn restore_snapshot(&mut self, snapshot: Snapshot) {
+        self.rope = snapshot.rope;
+        self.carets = snapshot.carets;
+        self.dragging = false;
+        self.last_kind = None;
+        self.dirty = self.is_dirty();
+    }
+
+    fn begin_edit(&mut self, kind: EditKind) {
+        let coalesce =
+            self.last_kind == Some(kind) && kind != EditKind::Hard && self.redo.is_empty();
+        if !coalesce {
+            self.undo.push(self.current_snapshot());
+        }
+        self.redo.clear();
+        self.last_kind = Some(kind);
+    }
+
+    fn undo(&mut self) {
+        if let Some(snapshot) = self.undo.pop() {
+            self.redo.push(self.current_snapshot());
+            self.restore_snapshot(snapshot);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(snapshot) = self.redo.pop() {
+            self.undo.push(self.current_snapshot());
+            self.restore_snapshot(snapshot);
+        }
+    }
+
     // ---- editing (applied to every caret) ----
 
     fn insert(&mut self, text: &str) {
+        let kind = if text == "\n" || text.chars().count() > 1 {
+            EditKind::Hard
+        } else {
+            EditKind::Insert
+        };
+        self.insert_with_kind(text, kind);
+    }
+
+    fn insert_with_kind(&mut self, text: &str, kind: EditKind) {
         let s = text.replace("\r\n", "\n").replace('\r', "\n");
+        if s.is_empty() {
+            return;
+        }
+        self.begin_edit(kind);
         let n = s.chars().count();
         let mut order: Vec<usize> = (0..self.carets.len()).collect();
         order.sort_by_key(|&i| self.carets[i].min());
@@ -176,6 +284,10 @@ impl Editor {
     }
 
     fn backspace(&mut self) {
+        if self.carets.iter().all(|c| c.is_empty() && c.head == 0) {
+            return;
+        }
+        self.begin_edit(EditKind::Delete);
         let mut order: Vec<usize> = (0..self.carets.len()).collect();
         order.sort_by_key(|&i| self.carets[i].min());
         let mut shift: isize = 0;
@@ -200,6 +312,10 @@ impl Editor {
 
     fn delete_forward(&mut self) {
         let len = self.rope.len_chars();
+        if self.carets.iter().all(|c| c.is_empty() && c.head >= len) {
+            return;
+        }
+        self.begin_edit(EditKind::Delete);
         let mut order: Vec<usize> = (0..self.carets.len()).collect();
         order.sort_by_key(|&i| self.carets[i].min());
         let mut shift: isize = 0;
@@ -224,11 +340,16 @@ impl Editor {
     // ---- movement ----
 
     fn move_h(&mut self, dir: isize, extend: bool) {
+        self.last_kind = None;
         let len = self.rope.len_chars();
         for i in 0..self.carets.len() {
             let c = self.carets[i];
             let new_head = if !extend && !c.is_empty() {
-                if dir < 0 { c.min() } else { c.max() }
+                if dir < 0 {
+                    c.min()
+                } else {
+                    c.max()
+                }
             } else {
                 (c.head as isize + dir).clamp(0, len as isize) as usize
             };
@@ -242,6 +363,7 @@ impl Editor {
     }
 
     fn move_v(&mut self, dir: isize, extend: bool) {
+        self.last_kind = None;
         let last_line = self.rope.len_lines().saturating_sub(1);
         for i in 0..self.carets.len() {
             let c = self.carets[i];
@@ -259,6 +381,7 @@ impl Editor {
     }
 
     fn move_home(&mut self, extend: bool) {
+        self.last_kind = None;
         for i in 0..self.carets.len() {
             let (line, _) = self.idx_to_lc(self.carets[i].head);
             let new_head = self.rope.line_to_char(line);
@@ -272,6 +395,7 @@ impl Editor {
     }
 
     fn move_end(&mut self, extend: bool) {
+        self.last_kind = None;
         for i in 0..self.carets.len() {
             let (line, _) = self.idx_to_lc(self.carets[i].head);
             let new_head = self.rope.line_to_char(line) + self.line_len_chars(line);
@@ -284,7 +408,33 @@ impl Editor {
         self.normalize();
     }
 
+    fn move_word(&mut self, dir: isize, extend: bool) {
+        let text = self.rope.to_string();
+        let chars: Vec<char> = text.chars().collect();
+        for i in 0..self.carets.len() {
+            let c = self.carets[i];
+            let from = if !extend && !c.is_empty() {
+                if dir < 0 {
+                    c.min()
+                } else {
+                    c.max()
+                }
+            } else {
+                c.head
+            };
+            let new_head = word_boundary(&chars, from, dir);
+            self.carets[i].head = new_head;
+            if !extend {
+                self.carets[i].anchor = new_head;
+            }
+            self.carets[i].goal_col = None;
+        }
+        self.last_kind = None;
+        self.normalize();
+    }
+
     fn select_all(&mut self) {
+        self.last_kind = None;
         self.carets = vec![Caret {
             anchor: 0,
             head: self.rope.len_chars(),
@@ -293,8 +443,411 @@ impl Editor {
     }
 
     fn collapse(&mut self) {
+        self.last_kind = None;
         let head = self.carets.last().map(|c| c.head).unwrap_or(0);
         self.carets = vec![Caret::point(head)];
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.carets
+            .iter()
+            .rev()
+            .find(|c| !c.is_empty())
+            .map(|c| self.rope.slice(c.min()..c.max()).to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn word_range_at_char(&self, idx: usize) -> Option<(usize, usize)> {
+        let head = idx.min(self.rope.len_chars());
+        let text = self.rope.to_string();
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let mut pos = head.min(chars.len().saturating_sub(1));
+        if pos == chars.len() || !is_word_char(chars[pos]) {
+            if pos > 0 && is_word_char(chars[pos - 1]) {
+                pos -= 1;
+            } else {
+                return None;
+            }
+        }
+
+        let mut start = pos;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = pos + 1;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+
+        Some((start, end))
+    }
+
+    fn select_word_at_char(&mut self, idx: usize, scroll_to_word: bool) -> Option<String> {
+        let (start, end) = self.word_range_at_char(idx)?;
+        let word = self.rope.slice(start..end).to_string();
+        self.carets = vec![Caret {
+            anchor: start,
+            head: end,
+            goal_col: None,
+        }];
+        self.drag = 0;
+        self.dragging = false;
+        self.last_kind = None;
+        if scroll_to_word {
+            self.pending_scroll_to = Some(start);
+        }
+        Some(word)
+    }
+
+    fn select_word_at_last_caret(&mut self) -> Option<String> {
+        let head = self
+            .carets
+            .last()
+            .map(|c| c.head)
+            .unwrap_or(0)
+            .min(self.rope.len_chars());
+        let (start, end) = self.word_range_at_char(head)?;
+        let word = self.rope.slice(start..end).to_string();
+        if let Some(last) = self.carets.last_mut() {
+            *last = Caret {
+                anchor: start,
+                head: end,
+                goal_col: None,
+            };
+        }
+        self.pending_scroll_to = Some(start);
+        Some(word)
+    }
+
+    fn select_next_occurrence(&mut self) {
+        self.last_kind = None;
+        let needle = match self.selected_text() {
+            Some(s) => s,
+            None => match self.select_word_at_last_caret() {
+                Some(s) => s,
+                None => return,
+            },
+        };
+        let text = self.rope.to_string();
+        let start_char = self.carets.iter().map(Caret::max).max().unwrap_or(0);
+        let mut search_ranges = Vec::new();
+        let start_byte = char_to_byte_idx(&text, start_char.min(self.rope.len_chars()));
+        search_ranges.push((start_byte, text.len()));
+        search_ranges.push((0, start_byte));
+
+        for (range_start, range_end) in search_ranges {
+            let haystack = &text[range_start..range_end];
+            let mut offset = 0;
+            while let Some(rel_idx) = haystack[offset..].find(&needle) {
+                let byte_idx = range_start + offset + rel_idx;
+                let start = text[..byte_idx].chars().count();
+                let end = start + needle.chars().count();
+                let next = Caret {
+                    anchor: start,
+                    head: end,
+                    goal_col: None,
+                };
+                if !self
+                    .carets
+                    .iter()
+                    .any(|c| c.min() == next.min() && c.max() == next.max())
+                {
+                    self.carets.push(next);
+                    self.normalize();
+                    self.pending_scroll_to = Some(start);
+                    return;
+                }
+                offset += rel_idx + needle.len();
+                if offset >= haystack.len() {
+                    break;
+                }
+            }
+        }
+
+        if let Some(last) = self.carets.last() {
+            self.pending_scroll_to = Some(last.min());
+        }
+    }
+
+    fn select_lines(&mut self) {
+        self.last_kind = None;
+        let mut next = Vec::new();
+        for line in self.selected_lines() {
+            next.push(Caret {
+                anchor: self.rope.line_to_char(line),
+                head: self.line_end_idx(line, false),
+                goal_col: None,
+            });
+        }
+        if !next.is_empty() {
+            self.carets = next;
+            self.normalize();
+        }
+    }
+
+    fn split_selection_into_lines(&mut self) {
+        self.last_kind = None;
+        let mut next = Vec::new();
+        for line in self.selected_lines() {
+            next.push(Caret {
+                anchor: self.rope.line_to_char(line),
+                head: self.line_end_idx(line, false),
+                goal_col: None,
+            });
+        }
+        if !next.is_empty() {
+            self.carets = next;
+        }
+    }
+
+    fn delete_lines(&mut self) {
+        let lines = self.selected_lines();
+        if lines.is_empty() {
+            return;
+        }
+        self.begin_edit(EditKind::Hard);
+        let target = self
+            .rope
+            .line_to_char(lines[0].min(self.rope.len_lines().saturating_sub(1)));
+        for &line in lines.iter().rev() {
+            let start = self.rope.line_to_char(line);
+            let mut end = self.line_end_idx(line, true);
+            if start == end && line > 0 {
+                end = start;
+                let prev = self.rope.line_to_char(line - 1);
+                self.rope.remove(prev..end);
+                continue;
+            }
+            self.rope.remove(start..end);
+        }
+        let pos = target.min(self.rope.len_chars());
+        self.carets = vec![Caret::point(pos)];
+        self.dirty = true;
+    }
+
+    fn duplicate_lines(&mut self) {
+        let lines = self.selected_lines();
+        if lines.is_empty() {
+            return;
+        }
+        self.begin_edit(EditKind::Hard);
+        let first = lines[0];
+        let last = *lines.last().unwrap();
+        let start = self.rope.line_to_char(first);
+        let end = self.line_end_idx(last, true);
+        let mut text = self.rope.slice(start..end).to_string();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        self.rope.insert(end, &text);
+        let offset = text.chars().count();
+        self.carets = self
+            .carets
+            .iter()
+            .map(|c| Caret {
+                anchor: c.anchor + offset,
+                head: c.head + offset,
+                goal_col: c.goal_col,
+            })
+            .collect();
+        self.dirty = true;
+        self.normalize();
+    }
+
+    fn delete_to_line_start(&mut self) {
+        if self.carets.iter().all(|c| {
+            let (line, _) = self.idx_to_lc(c.head);
+            c.is_empty() && c.head == self.rope.line_to_char(line)
+        }) {
+            return;
+        }
+        self.begin_edit(EditKind::Hard);
+        let mut order: Vec<usize> = (0..self.carets.len()).collect();
+        order.sort_by_key(|&i| self.carets[i].min());
+        let mut shift: isize = 0;
+        for &i in &order {
+            let a = (self.carets[i].min() as isize + shift) as usize;
+            let b = (self.carets[i].max() as isize + shift) as usize;
+            if b > a {
+                self.rope.remove(a..b);
+                self.carets[i] = Caret::point(a);
+                shift -= (b - a) as isize;
+            } else {
+                let line = self.rope.char_to_line(a);
+                let start = self.rope.line_to_char(line);
+                if a > start {
+                    self.rope.remove(start..a);
+                    self.carets[i] = Caret::point(start);
+                    shift -= (a - start) as isize;
+                }
+            }
+        }
+        self.dirty = true;
+        self.normalize();
+    }
+
+    fn insert_line_after(&mut self) {
+        self.begin_edit(EditKind::Hard);
+        let mut positions: Vec<usize> = self
+            .carets
+            .iter()
+            .map(|c| {
+                let line = self.rope.char_to_line(c.head.min(self.rope.len_chars()));
+                self.line_end_idx(line, false)
+            })
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        let mut shift = 0usize;
+        let mut next = Vec::new();
+        for pos in positions {
+            let p = pos + shift;
+            self.rope.insert(p, "\n");
+            next.push(Caret::point(p + 1));
+            shift += 1;
+        }
+        self.carets = next;
+        self.dirty = true;
+    }
+
+    fn insert_line_before(&mut self) {
+        self.begin_edit(EditKind::Hard);
+        let mut positions: Vec<usize> = self
+            .carets
+            .iter()
+            .map(|c| {
+                let line = self.rope.char_to_line(c.head.min(self.rope.len_chars()));
+                self.rope.line_to_char(line)
+            })
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        let mut shift = 0usize;
+        let mut next = Vec::new();
+        for pos in positions {
+            let p = pos + shift;
+            self.rope.insert(p, "\n");
+            next.push(Caret::point(p));
+            shift += 1;
+        }
+        self.carets = next;
+        self.dirty = true;
+    }
+
+    fn toggle_line_comment(&mut self) {
+        let lines = self.selected_lines();
+        if lines.is_empty() {
+            return;
+        }
+        self.begin_edit(EditKind::Hard);
+        let all_commented = lines.iter().all(|&line| {
+            let start = self.rope.line_to_char(line);
+            let end = self.line_end_idx(line, false);
+            self.rope
+                .slice(start..end)
+                .to_string()
+                .trim_start()
+                .starts_with("//")
+        });
+        for &line in lines.iter().rev() {
+            let start = self.rope.line_to_char(line);
+            let end = self.line_end_idx(line, false);
+            let text = self.rope.slice(start..end).to_string();
+            let indent = text.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+            let pos = start + indent;
+            if all_commented {
+                if self.rope.slice(pos..end).to_string().starts_with("// ") {
+                    self.rope.remove(pos..pos + 3);
+                } else if self.rope.slice(pos..end).to_string().starts_with("//") {
+                    self.rope.remove(pos..pos + 2);
+                }
+            } else {
+                self.rope.insert(pos, "// ");
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn indent(&mut self) {
+        if self.carets.iter().all(Caret::is_empty) {
+            self.insert_with_kind("    ", EditKind::Hard);
+            return;
+        }
+        let lines = self.selected_lines();
+        if lines.is_empty() {
+            return;
+        }
+        self.begin_edit(EditKind::Hard);
+        for &line in &lines {
+            let pos = self.rope.line_to_char(line);
+            self.rope.insert(pos, "    ");
+        }
+        let line_set = lines;
+        for c in &mut self.carets {
+            let anchor_line = self.rope.char_to_line(c.anchor.min(self.rope.len_chars()));
+            let head_line = self.rope.char_to_line(c.head.min(self.rope.len_chars()));
+            let anchor_shift = line_set
+                .iter()
+                .filter(|&&line| line < anchor_line || line == anchor_line)
+                .count()
+                * 4;
+            let head_shift = line_set
+                .iter()
+                .filter(|&&line| line < head_line || line == head_line)
+                .count()
+                * 4;
+            c.anchor += anchor_shift;
+            c.head += head_shift;
+        }
+        self.dirty = true;
+        self.normalize();
+    }
+
+    fn unindent(&mut self) {
+        let lines = self.selected_lines();
+        if lines.is_empty() {
+            return;
+        }
+        self.begin_edit(EditKind::Hard);
+        let mut removed_before = Vec::new();
+        for &line in lines.iter().rev() {
+            let start = self.rope.line_to_char(line);
+            let end = (start + self.line_len_chars(line)).min(self.rope.len_chars());
+            let line_text = self.rope.slice(start..end).to_string();
+            let remove = if line_text.starts_with("    ") {
+                4
+            } else if line_text.starts_with('\t') || line_text.starts_with(' ') {
+                1
+            } else {
+                0
+            };
+            if remove > 0 {
+                self.rope.remove(start..start + remove);
+                removed_before.push((line, remove));
+            }
+        }
+        for c in &mut self.carets {
+            let anchor_line = self.rope.char_to_line(c.anchor.min(self.rope.len_chars()));
+            let head_line = self.rope.char_to_line(c.head.min(self.rope.len_chars()));
+            let anchor_shift: usize = removed_before
+                .iter()
+                .filter(|&&(line, _)| line <= anchor_line)
+                .map(|&(_, n)| n)
+                .sum();
+            let head_shift: usize = removed_before
+                .iter()
+                .filter(|&&(line, _)| line <= head_line)
+                .map(|&(_, n)| n)
+                .sum();
+            c.anchor = c.anchor.saturating_sub(anchor_shift);
+            c.head = c.head.saturating_sub(head_shift);
+        }
+        self.dirty = true;
+        self.normalize();
     }
 
     fn copy(&self, ctx: &egui::Context) {
@@ -330,7 +883,11 @@ impl Editor {
                 if overlap && !(both_points) {
                     let anchor = last.min().min(c.min());
                     let head = last.max().max(c.max());
-                    *last = Caret { anchor, head, goal_col: None };
+                    *last = Caret {
+                        anchor,
+                        head,
+                        goal_col: None,
+                    };
                     continue;
                 }
             }
@@ -349,11 +906,27 @@ impl Editor {
         for ev in events {
             match ev {
                 egui::Event::Text(t) if !t.is_empty() => self.insert(&t),
+                // CJK / IME input arrives here, not as `Text`.
+                egui::Event::Ime(ime) => match ime {
+                    egui::ImeEvent::Preedit(t) => self.preedit = t,
+                    egui::ImeEvent::Commit(t) => {
+                        self.preedit.clear();
+                        if !t.is_empty() {
+                            self.insert(&t);
+                        }
+                    }
+                    egui::ImeEvent::Enabled => {}
+                    egui::ImeEvent::Disabled => self.preedit.clear(),
+                },
                 egui::Event::Paste(t) => self.insert(&t),
                 egui::Event::Copy => self.copy(ctx),
                 egui::Event::Cut => {
                     self.copy(ctx);
-                    self.backspace();
+                    if self.carets.iter().all(Caret::is_empty) {
+                        self.delete_lines();
+                    } else {
+                        self.backspace();
+                    }
                 }
                 egui::Event::Key {
                     key,
@@ -363,9 +936,30 @@ impl Editor {
                 } => {
                     use egui::Key::*;
                     match key {
+                        Z if modifiers.command && modifiers.shift => self.redo(),
+                        Z if modifiers.command => self.undo(),
+                        Y if modifiers.command => self.redo(),
+                        K if modifiers.command && modifiers.shift => self.delete_lines(),
+                        D if modifiers.command && modifiers.shift => self.duplicate_lines(),
+                        D if modifiers.command => self.select_next_occurrence(),
+                        L if modifiers.command && modifiers.shift => {
+                            self.split_selection_into_lines()
+                        }
+                        L if modifiers.command => self.select_lines(),
+                        Slash if modifiers.command => self.toggle_line_comment(),
+                        A if modifiers.command => self.select_all(),
+                        Enter if modifiers.command && modifiers.shift => self.insert_line_before(),
+                        Enter if modifiers.command => self.insert_line_after(),
                         Enter => self.insert("\n"),
+                        Backspace if modifiers.command => self.delete_to_line_start(),
                         Backspace => self.backspace(),
                         Delete => self.delete_forward(),
+                        Tab if modifiers.shift => self.unindent(),
+                        Tab => self.indent(),
+                        ArrowLeft if modifiers.command => self.move_home(modifiers.shift),
+                        ArrowRight if modifiers.command => self.move_end(modifiers.shift),
+                        ArrowLeft if modifiers.alt => self.move_word(-1, modifiers.shift),
+                        ArrowRight if modifiers.alt => self.move_word(1, modifiers.shift),
                         ArrowLeft => self.move_h(-1, modifiers.shift),
                         ArrowRight => self.move_h(1, modifiers.shift),
                         ArrowUp => self.move_v(-1, modifiers.shift),
@@ -373,7 +967,6 @@ impl Editor {
                         Home => self.move_home(modifiers.shift),
                         End => self.move_end(modifiers.shift),
                         Escape => self.collapse(),
-                        A if modifiers.command => self.select_all(),
                         _ => {}
                     }
                 }
@@ -385,14 +978,29 @@ impl Editor {
     fn apply_pointer(&mut self, p: &Pointer, hit: Option<usize>) {
         if let Some(idx) = hit {
             if p.pressed {
-                if p.cmd {
+                let double_click = !p.cmd
+                    && !p.shift
+                    && self
+                        .last_click_idx
+                        .is_some_and(|last| last.abs_diff(idx) <= 1)
+                    && p.time - self.last_click_time <= DOUBLE_CLICK_SECONDS;
+                self.last_click_time = p.time;
+                self.last_click_idx = Some(idx);
+
+                if double_click {
+                    self.select_word_at_char(idx, false);
+                    return;
+                } else if p.cmd {
+                    self.last_kind = None;
                     self.carets.push(Caret::point(idx));
                     self.drag = self.carets.len() - 1;
                 } else if p.shift {
+                    self.last_kind = None;
                     let li = self.carets.len() - 1;
                     self.carets[li].head = idx;
                     self.drag = li;
                 } else {
+                    self.last_kind = None;
                     self.carets = vec![Caret::point(idx)];
                     self.drag = 0;
                 }
@@ -412,7 +1020,8 @@ impl Editor {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         // Keyboard first (skip if an egui widget — e.g. a settings field — wants keys).
-        if !ui.ctx().wants_keyboard_input() {
+        let editor_active = !ui.ctx().wants_keyboard_input();
+        if editor_active {
             self.handle_keys(ui.ctx());
         }
 
@@ -422,112 +1031,167 @@ impl Editor {
             down: i.pointer.primary_down(),
             cmd: i.modifiers.command,
             shift: i.modifiers.shift,
+            time: i.time,
         });
 
         let font = TextStyle::Monospace.resolve(ui.style());
         let row_h = ui.text_style_height(&TextStyle::Monospace);
+        let row_step = row_h + ui.spacing().item_spacing.y;
         let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
         let total = self.rope.len_lines();
         let num_w = ((total.max(1) as f32).log10().floor() as usize) + 1;
         let gutter_w = (num_w as f32 + 2.0) * char_w + 6.0;
+        let scroll_to = self.pending_scroll_to.take();
+        let scroll_offset = scroll_to.map(|idx| {
+            let line = self.rope.char_to_line(idx.min(self.rope.len_chars()));
+            (line as f32 * row_step - ui.available_height() * 0.45).max(0.0)
+        });
 
         let mut hit: Option<usize> = None;
+        let mut ime_rect: Option<Rect> = None;
         let view = &*self; // immutable view for the render closure
 
-        egui::ScrollArea::both()
+        let mut scroll_area = egui::ScrollArea::both()
             .auto_shrink([false, false])
-            .drag_to_scroll(false)
-            .show_rows(ui, row_h, total, |ui, range| {
-                for line_idx in range {
-                    let text = view.line_text(line_idx);
-                    let mut job = LayoutJob::default();
-                    job.wrap.max_width = f32::INFINITY;
-                    for sp in highlight::spans(&text, view.lang) {
-                        job.append(
-                            &text[sp.start..sp.end],
-                            0.0,
-                            TextFormat {
-                                font_id: font.clone(),
-                                color: sp.color,
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    let galley = ui.fonts(|f| f.layout_job(job));
-
-                    let row_w = (gutter_w + galley.size().x + char_w).max(ui.available_width());
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
-                    let painter = ui.painter();
-                    let text_origin = Pos2::new(rect.left() + gutter_w, rect.top());
-
-                    painter.text(
-                        Pos2::new(rect.left() + 4.0, rect.top()),
-                        Align2::LEFT_TOP,
-                        format!("{:>nw$}", line_idx + 1, nw = num_w),
-                        font.clone(),
-                        theme::TEXT_MUTED,
+            .drag_to_scroll(false);
+        if let Some(offset) = scroll_offset {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        }
+        scroll_area.show_rows(ui, row_h, total, |ui, range| {
+            for line_idx in range {
+                let text = view.line_text(line_idx);
+                let mut job = LayoutJob::default();
+                job.wrap.max_width = f32::INFINITY;
+                for sp in highlight::spans(&text, view.lang) {
+                    job.append(
+                        &text[sp.start..sp.end],
+                        0.0,
+                        TextFormat {
+                            font_id: font.clone(),
+                            color: sp.color,
+                            ..Default::default()
+                        },
                     );
+                }
+                let galley = ui.fonts(|f| f.layout_job(job));
 
-                    let line_start = view.rope.line_to_char(line_idx);
-                    let llen = view.line_len_chars(line_idx);
+                let row_w = (gutter_w + galley.size().x + char_w).max(ui.available_width());
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
+                let painter = ui.painter();
+                let text_origin = Pos2::new(rect.left() + gutter_w, rect.top());
 
-                    // Selection highlights.
-                    for c in &view.carets {
-                        if c.is_empty() {
-                            continue;
-                        }
-                        let s_line = view.rope.char_to_line(c.min());
-                        let e_line = view.rope.char_to_line(c.max());
-                        if line_idx < s_line || line_idx > e_line {
-                            continue;
-                        }
-                        let start_col = if line_idx == s_line { c.min() - line_start } else { 0 };
-                        let end_col = if line_idx == e_line { c.max() - line_start } else { llen };
-                        let x0 = text_origin.x + col_x(&galley, start_col.min(llen));
-                        let mut x1 = text_origin.x + col_x(&galley, end_col.min(llen));
-                        if line_idx < e_line {
-                            x1 = (text_origin.x + galley.size().x + char_w).max(x1);
-                        }
+                painter.text(
+                    Pos2::new(rect.left() + 4.0, rect.top()),
+                    Align2::LEFT_TOP,
+                    format!("{:>nw$}", line_idx + 1, nw = num_w),
+                    font.clone(),
+                    theme::TEXT_MUTED,
+                );
+
+                let line_start = view.rope.line_to_char(line_idx);
+                let llen = view.line_len_chars(line_idx);
+
+                // Selection highlights.
+                for c in &view.carets {
+                    if c.is_empty() {
+                        continue;
+                    }
+                    let s_line = view.rope.char_to_line(c.min());
+                    let e_line = view.rope.char_to_line(c.max());
+                    if line_idx < s_line || line_idx > e_line {
+                        continue;
+                    }
+                    let start_col = if line_idx == s_line {
+                        c.min() - line_start
+                    } else {
+                        0
+                    };
+                    let end_col = if line_idx == e_line {
+                        c.max() - line_start
+                    } else {
+                        llen
+                    };
+                    let x0 = text_origin.x + col_x(&galley, start_col.min(llen));
+                    let mut x1 = text_origin.x + col_x(&galley, end_col.min(llen));
+                    if line_idx < e_line {
+                        x1 = (text_origin.x + galley.size().x + char_w).max(x1);
+                    }
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.bottom())),
+                        0.0,
+                        theme::SELECTION_BG,
+                    );
+                }
+
+                painter.galley(text_origin, galley.clone(), theme::TEXT);
+
+                // Carets on this line.
+                let primary = view.carets.len().saturating_sub(1);
+                for (ci, c) in view.carets.iter().enumerate() {
+                    if view.rope.char_to_line(c.head) != line_idx {
+                        continue;
+                    }
+                    let col = c.head - line_start;
+                    let mut x = text_origin.x + col_x(&galley, col.min(llen));
+
+                    // Inline IME composition at the primary caret.
+                    if ci == primary && !view.preedit.is_empty() {
+                        let pre = ui.fonts(|f| {
+                            f.layout(view.preedit.clone(), font.clone(), theme::TEXT, f32::INFINITY)
+                        });
+                        let w = pre.size().x;
                         painter.rect_filled(
-                            Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.bottom())),
+                            Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(w, row_h)),
                             0.0,
-                            theme::SELECTION_BG,
+                            theme::INSET,
                         );
+                        painter.galley(Pos2::new(x, rect.top()), pre, theme::TEXT);
+                        painter.hline(
+                            x..=x + w,
+                            rect.bottom() - 1.5,
+                            egui::Stroke::new(1.0, theme::ACCENT),
+                        );
+                        x += w;
                     }
 
-                    painter.galley(text_origin, galley.clone(), theme::TEXT);
-
-                    // Carets on this line.
-                    for c in &view.carets {
-                        if view.rope.char_to_line(c.head) != line_idx {
-                            continue;
-                        }
-                        let col = c.head - line_start;
-                        let x = text_origin.x + col_x(&galley, col.min(llen));
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(x, rect.top() + 1.0),
-                                Pos2::new(x + 2.0, rect.bottom() - 1.0),
-                            ),
-                            0.0,
-                            CARET_COLOR,
-                        );
+                    let caret_rect = Rect::from_min_max(
+                        Pos2::new(x, rect.top() + 1.0),
+                        Pos2::new(x + 2.0, rect.bottom() - 1.0),
+                    );
+                    painter.rect_filled(caret_rect, 0.0, CARET_COLOR);
+                    if ci == primary {
+                        ime_rect = Some(caret_rect);
                     }
+                }
 
-                    // Hit-test for mouse interaction.
-                    if (p.pressed || p.down) && hit.is_none() {
-                        if let Some(pos) = p.pos {
-                            if pos.y >= rect.top() && pos.y < rect.bottom() {
-                                let local = pos - text_origin;
-                                let cur = galley.cursor_from_pos(local);
-                                hit = Some(line_start + cur.ccursor.index.min(llen));
-                            }
+                // Hit-test for mouse interaction.
+                if (p.pressed || p.down) && hit.is_none() {
+                    if let Some(pos) = p.pos {
+                        if pos.y >= rect.top() && pos.y < rect.bottom() {
+                            let local = pos - text_origin;
+                            let cur = galley.cursor_from_pos(local);
+                            hit = Some(line_start + cur.ccursor.index.min(llen));
                         }
                     }
                 }
-            });
+            }
+        });
 
         self.apply_pointer(&p, hit);
+
+        // Enable and position the native IME. egui-winit only calls
+        // `set_ime_allowed(true)` when `output.ime` is `Some`, so without this
+        // macOS never sends composition events and CJK input is impossible.
+        if editor_active {
+            let rect = ime_rect
+                .unwrap_or_else(|| Rect::from_min_size(ui.min_rect().min, Vec2::new(1.0, row_h)));
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    rect,
+                    cursor_rect: rect,
+                });
+            });
+        }
 
         // Keep animating while interacting so drag-select stays responsive.
         if p.down {
@@ -540,4 +1204,49 @@ impl Editor {
 fn col_x(galley: &egui::Galley, col: usize) -> f32 {
     let cursor = galley.from_ccursor(CCursor::new(col));
     galley.pos_from_cursor(&cursor).min.x
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len())
+}
+
+fn word_boundary(chars: &[char], from: usize, dir: isize) -> usize {
+    if dir < 0 {
+        let mut i = from.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i > 0 && is_word_char(chars[i - 1]) {
+            while i > 0 && is_word_char(chars[i - 1]) {
+                i -= 1;
+            }
+        } else {
+            while i > 0 && !chars[i - 1].is_whitespace() && !is_word_char(chars[i - 1]) {
+                i -= 1;
+            }
+        }
+        i
+    } else {
+        let mut i = from.min(chars.len());
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i < chars.len() && is_word_char(chars[i]) {
+            while i < chars.len() && is_word_char(chars[i]) {
+                i += 1;
+            }
+        } else {
+            while i < chars.len() && !chars[i].is_whitespace() && !is_word_char(chars[i]) {
+                i += 1;
+            }
+        }
+        i
+    }
 }

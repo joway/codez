@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 
 use egui::text::LayoutJob;
-use egui::{Color32, Pos2, Rect, ScrollArea, TextFormat, TextStyle, Ui};
+use egui::{Color32, Pos2, Rect, ScrollArea, Sense, TextFormat, TextStyle, Ui, Vec2};
 
 use crate::theme;
 
@@ -31,22 +31,16 @@ pub fn diff_view(ui: &mut Ui, src: &impl LineSource) {
     let font = TextStyle::Monospace.resolve(ui.style());
     let row_h = ui.text_style_height(&TextStyle::Monospace);
     let total = src.line_count();
+    let viewport_rect = ui.available_rect_before_wrap();
 
-    ScrollArea::both()
+    ui.painter().rect_filled(viewport_rect, 0.0, theme::INSET);
+
+    ScrollArea::vertical()
         .auto_shrink([false, false])
         .show_rows(ui, row_h, total, |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for i in range {
                 let line = src.line(i);
-                if let Some(bg) = diff_bg(&line) {
-                    let clip = ui.clip_rect();
-                    let top = ui.cursor().top();
-                    let rect = Rect::from_min_max(
-                        Pos2::new(clip.left(), top),
-                        Pos2::new(clip.right(), top + row_h),
-                    );
-                    ui.painter().rect_filled(rect, 0.0, bg);
-                }
                 let mut job = LayoutJob::default();
                 job.wrap.max_width = f32::INFINITY;
                 job.append(
@@ -58,7 +52,18 @@ pub fn diff_view(ui: &mut Ui, src: &impl LineSource) {
                         ..Default::default()
                     },
                 );
-                ui.label(job);
+                let galley = ui.fonts(|f| f.layout_job(job));
+                let row_w = ui.available_width();
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
+
+                let clip = ui.clip_rect();
+                let bg_rect = Rect::from_min_max(
+                    Pos2::new(clip.left(), rect.top()),
+                    Pos2::new(clip.right(), rect.bottom()),
+                );
+                ui.painter()
+                    .rect_filled(bg_rect, 0.0, diff_bg(&line).unwrap_or(theme::INSET));
+                ui.painter().galley(rect.left_top(), galley, theme::TEXT);
             }
         });
 }
