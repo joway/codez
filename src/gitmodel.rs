@@ -95,6 +95,45 @@ pub fn commit_paths(
     Ok(oid)
 }
 
+/// The current branch's short name (e.g. `main`), or `None` when HEAD is
+/// detached or the repo has no commits yet.
+pub fn current_branch(repo: &Repository) -> Option<String> {
+    let head = repo.head().ok()?;
+    if head.is_branch() {
+        head.shorthand().map(str::to_string)
+    } else {
+        None
+    }
+}
+
+/// Push `branch` to `origin` by shelling out to the system `git`, so it reuses
+/// the user's existing credential setup (ssh-agent, credential helpers) rather
+/// than reimplementing auth through libgit2. Returns a short status line on
+/// success, or an error message. Blocks on the network — run off the UI thread.
+pub fn push_origin(workdir: &Path, branch: &str) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(["push", "origin", branch])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    // git push writes its human-readable result to stderr in both cases.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last = stderr.lines().last().unwrap_or("").trim();
+    if output.status.success() {
+        Ok(if last.is_empty() {
+            "Pushed".to_string()
+        } else {
+            last.to_string()
+        })
+    } else {
+        Err(if last.is_empty() {
+            format!("git push failed ({})", output.status)
+        } else {
+            last.to_string()
+        })
+    }
+}
+
 /// Walk history from HEAD (newest first), up to `max` commits.
 pub fn list_commits(repo: &Repository, max: usize) -> Result<Vec<CommitInfo>, git2::Error> {
     let mut walk = repo.revwalk()?;

@@ -54,6 +54,9 @@ pub struct DiffistApp {
     selected_change: Option<usize>,
     diff_lines: Vec<String>,
     git_status: String,
+    /// Background `git push` result channel; `Some` while a push is in flight.
+    push_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    push_status: String,
 
     // --- Chrome ---
     menus: Menus,
@@ -120,6 +123,8 @@ impl DiffistApp {
             selected_change: None,
             diff_lines: Vec::new(),
             git_status: String::new(),
+            push_rx: None,
+            push_status: String::new(),
             menus: Menus::install(),
             settings: Settings::default(),
             title_dirty: false,
@@ -322,27 +327,19 @@ impl DiffistApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
-                    let width = (ui.available_width() - 30.0).max(60.0) / 2.0;
-                    let new_codex = ui
+                    let width = (ui.available_width() - 24.0).max(80.0);
+                    // A blank terminal — the user runs whatever they want
+                    // (`codex`, `claude`, a plain shell, …).
+                    if ui
                         .add_sized(
                             Vec2::new(width, 30.0),
-                            egui::Button::new(RichText::new("+ Codex").color(theme::TEXT))
+                            egui::Button::new(RichText::new("+ New Terminal").color(theme::TEXT))
                                 .fill(theme::RAISED),
                         )
-                        .clicked();
-                    let new_claude = ui
-                        .add_sized(
-                            Vec2::new(width, 30.0),
-                            egui::Button::new(RichText::new("+ Claude").color(theme::TEXT))
-                                .fill(theme::RAISED),
-                        )
-                        .clicked();
-                    if new_codex {
+                        .clicked()
+                    {
                         self.selected_session = None;
-                        self.start_terminal(ui.ctx(), Some("codex".to_string()));
-                    } else if new_claude {
-                        self.selected_session = None;
-                        self.start_terminal(ui.ctx(), Some("claude".to_string()));
+                        self.start_terminal(ui.ctx(), None);
                     }
                 });
                 ui.add_space(8.0);
@@ -381,7 +378,7 @@ impl DiffistApp {
                     }
                     None => diff_empty_state(
                         ui,
-                        "Select a session to resume, or start a new Codex session",
+                        "Select a session to resume, or open a new terminal",
                     ),
                 }
             });
@@ -714,6 +711,17 @@ impl DiffistApp {
     // ---------------- Git Diff mode ----------------
 
     fn git_diff_ui(&mut self, ctx: &egui::Context) {
+        // Collect a finished background push, if any.
+        if let Some(rx) = &self.push_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.push_status = match result {
+                    Ok(msg) => msg,
+                    Err(err) => format!("push failed: {err}"),
+                };
+                self.push_rx = None;
+            }
+        }
+
         // Land on something useful instead of an empty pane.
         if self.diff_tab == DiffSidebarTab::Changed
             && self.selected_local_change.is_none()
@@ -746,6 +754,13 @@ impl DiffistApp {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Repository".to_string());
                 diff_sidebar_header(ui, &repo_name, &self.git_status);
+                let branch = self
+                    .repo
+                    .as_ref()
+                    .and_then(gitmodel::current_branch);
+                if push_toolbar(ui, branch.as_deref(), self.push_rx.is_some(), &self.push_status) {
+                    self.start_push(ui.ctx());
+                }
                 if let Some(tab) = diff_tab_bar(
                     ui,
                     self.diff_tab,
@@ -921,6 +936,34 @@ impl DiffistApp {
         }
     }
 
+    /// Kick off `git push origin <current-branch>` on a background thread.
+    fn start_push(&mut self, ctx: &egui::Context) {
+        if self.push_rx.is_some() {
+            return; // already pushing
+        }
+        let (Some(repo), Some(branch)) = (
+            self.repo.as_ref(),
+            self.repo.as_ref().and_then(gitmodel::current_branch),
+        ) else {
+            self.push_status = "no branch to push (detached HEAD?)".to_string();
+            return;
+        };
+        let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
+            self.push_status = "no working directory".to_string();
+            return;
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = gitmodel::push_origin(&workdir, &branch);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.push_rx = Some(rx);
+        self.push_status = "Pushing…".to_string();
+    }
+
     fn refresh_git_diff_state(&mut self) {
         if let Some(repo) = &self.repo {
             match gitmodel::workdir_changes(repo) {
@@ -981,6 +1024,53 @@ impl DiffistApp {
 }
 
 // ---------------- small view helpers ----------------
+
+/// A repo-level "Push" button (`git push origin <branch>`) plus its last
+/// status line. Returns true when clicked. Disabled while a push is running or
+/// when there is no current branch.
+fn push_toolbar(ui: &mut egui::Ui, branch: Option<&str>, pushing: bool, status: &str) -> bool {
+    let font_size = ui_font_size(ui);
+    ui.add_space(2.0);
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        let label = match branch {
+            Some(b) if pushing => format!("Pushing origin/{b}…"),
+            Some(b) => format!("⬆ Push  origin/{b}"),
+            None => "⬆ Push".to_string(),
+        };
+        let enabled = branch.is_some() && !pushing;
+        let width = (ui.available_width() - 28.0).max(80.0);
+        let button = egui::Button::new(RichText::new(label).color(theme::TEXT).size(font_size * 0.85))
+            .fill(if enabled { theme::SIDEBAR_SELECTED } else { theme::RAISED });
+        clicked = ui
+            .add_enabled(enabled, button.min_size(Vec2::new(width, 30.0)))
+            .clicked();
+    });
+    if !status.is_empty() {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            let color = if status.starts_with("push failed") {
+                theme::RED
+            } else {
+                theme::TEXT_DIM
+            };
+            ui.label(
+                RichText::new(ellipsize(
+                    ui,
+                    status,
+                    FontId::proportional(font_size * 0.74),
+                    (ui.available_width() - 14.0).max(40.0),
+                ))
+                .color(color)
+                .size(font_size * 0.74),
+            );
+        });
+    }
+    ui.add_space(8.0);
+    clicked
+}
 
 fn diff_sidebar_header(ui: &mut egui::Ui, repo_name: &str, status: &str) {
     ui.add_space(14.0);

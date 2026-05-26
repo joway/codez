@@ -189,6 +189,16 @@ impl Terminal {
                 )
             });
             self.process_input(ui);
+            // Tell the platform to enable IME and anchor the candidate window at
+            // the terminal cursor, so CJK input methods work and pop up in the
+            // right place.
+            let cursor_rect = self.cursor_rect(rect, cell);
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    rect: cursor_rect,
+                    cursor_rect,
+                })
+            });
         }
 
         self.paint(&painter, rect, cell, &font);
@@ -214,6 +224,17 @@ impl Terminal {
             .resize(TermSize::new(cols as usize, lines as usize));
     }
 
+    /// Screen rectangle of the current text cursor cell (for IME placement).
+    fn cursor_rect(&self, rect: Rect, cell: Vec2) -> Rect {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let point = grid.cursor.point;
+        let line = (point.line.0 + grid.display_offset() as i32) as f32;
+        let x = rect.min.x + cell.x * point.column.0 as f32;
+        let y = rect.min.y + cell.y * line;
+        Rect::from_min_size(Pos2::new(x, y), cell)
+    }
+
     fn process_input(&self, ui: &Ui) {
         let app_cursor = self.term.lock().mode().contains(TermMode::APP_CURSOR);
         let mut out: Vec<u8> = Vec::new();
@@ -226,6 +247,12 @@ impl Terminal {
                     if t.chars().all(|c| !c.is_control()) {
                         out.extend_from_slice(t.as_bytes());
                     }
+                }
+                // Committed IME composition (e.g. Chinese/Japanese input). The
+                // in-progress preedit arrives as `Preedit` and is ignored — the
+                // OS draws the candidate window itself.
+                egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                    out.extend_from_slice(t.as_bytes());
                 }
                 egui::Event::Key {
                     key,
