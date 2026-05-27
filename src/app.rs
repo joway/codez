@@ -221,6 +221,7 @@ impl eframe::App for CodezApp {
                 self.palette.open_files(&root);
             }
         }
+        self.handle_terminal_tab_shortcuts(ctx);
         self.handle_palette(ctx);
         self.poll_update(ctx);
         self.check_external_change();
@@ -356,6 +357,7 @@ impl CodezApp {
                             &[
                                 ("⌘C", "Copy selection"),
                                 ("⌘V", "Paste"),
+                                ("⌘⌥1…9", "Switch terminal tab"),
                                 ("⌘+Click", "Open link under cursor"),
                                 ("Drag", "Select text"),
                                 ("Double / Triple-click", "Select word / line"),
@@ -581,6 +583,20 @@ impl CodezApp {
                 self.git_status = "not a git repository".to_string();
                 false
             }
+        }
+    }
+
+    fn handle_terminal_tab_shortcuts(&mut self, ctx: &egui::Context) {
+        let Some(index) = terminal_tab_shortcut(ctx) else {
+            return;
+        };
+        if index >= self.terminals.len() {
+            return;
+        }
+        self.mode = Mode::Agent;
+        self.active_term = Some(index);
+        if let Some(tab) = self.terminals.get_mut(index) {
+            tab.terminal.request_focus();
         }
     }
 
@@ -2472,6 +2488,24 @@ fn status_color(s: char) -> Color32 {
         'R' | 'C' => theme::ACCENT,
         _ => theme::TEXT_DIM,
     }
+}
+
+fn terminal_tab_shortcut(ctx: &egui::Context) -> Option<usize> {
+    const KEYS: [egui::Key; 9] = [
+        egui::Key::Num1,
+        egui::Key::Num2,
+        egui::Key::Num3,
+        egui::Key::Num4,
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+        egui::Key::Num9,
+    ];
+
+    KEYS.iter().position(|key| {
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::ALT, *key))
+    })
 }
 
 // ---------------- file-tree helpers ----------------
