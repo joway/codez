@@ -97,6 +97,8 @@ pub struct CodezApp {
     usage_at: Option<std::time::Instant>,
     /// Last time the Diff page re-probed a non-git folder for a new repo.
     git_recheck_at: std::time::Instant,
+    git_watch_at: std::time::Instant,
+    git_state_token: Option<String>,
 }
 
 /// One terminal tab in Agent mode.
@@ -175,6 +177,8 @@ impl CodezApp {
             agent_status: String::new(),
             agent_scan_at: std::time::Instant::now(),
             git_recheck_at: std::time::Instant::now(),
+            git_watch_at: std::time::Instant::now(),
+            git_state_token: None,
         };
         if let Some(dir) = initial_dir {
             app.open_folder(&dir);
@@ -502,6 +506,7 @@ impl CodezApp {
         self.changes.clear();
         self.selected_change = None;
         self.diff_lines.clear();
+        self.git_state_token = None;
 
         // Drop any running terminals (sends shutdown) and rescan agent sessions.
         self.terminals.clear();
@@ -539,6 +544,7 @@ impl CodezApp {
                             commits.len()
                         );
                         self.commits = commits;
+                        self.git_state_token = gitmodel::state_token(&repo).ok();
                         self.repo = Some(repo);
                     }
                     Err(e) => self.git_status = format!("git error: {e}"),
@@ -1072,6 +1078,8 @@ impl CodezApp {
                 self.load_git_state();
             }
             ctx.request_repaint_after(interval);
+        } else {
+            self.poll_git_external_changes(ctx);
         }
 
         // Collect a finished background push, if any.
@@ -1354,7 +1362,34 @@ impl CodezApp {
                 }
                 Err(e) => self.git_status = format!("git error: {e}"),
             }
+            self.git_state_token = gitmodel::state_token(repo).ok();
         }
+    }
+
+    fn poll_git_external_changes(&mut self, ctx: &egui::Context) {
+        let interval = std::time::Duration::from_millis(1200);
+        if self.git_watch_at.elapsed() < interval {
+            ctx.request_repaint_after(interval);
+            return;
+        }
+        self.git_watch_at = std::time::Instant::now();
+
+        let changed = self
+            .repo
+            .as_ref()
+            .and_then(|repo| gitmodel::state_token(repo).ok())
+            .is_some_and(|token| {
+                let changed = self.git_state_token.as_deref() != Some(token.as_str());
+                self.git_state_token = Some(token);
+                changed
+            });
+        if changed {
+            self.refresh_git_diff_state();
+            self.selected_commit = None;
+            self.selected_change = None;
+            self.diff_lines.clear();
+        }
+        ctx.request_repaint_after(interval);
     }
 
     fn select_commit(&mut self, idx: usize) {

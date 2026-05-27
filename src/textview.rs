@@ -7,7 +7,10 @@
 use std::borrow::Cow;
 
 use egui::text::LayoutJob;
-use egui::{Color32, Pos2, Rect, ScrollArea, Sense, TextFormat, TextStyle, Ui, Vec2};
+use egui::{
+    Align, Color32, Layout, Pos2, Rect, ScrollArea, Sense, TextFormat, TextStyle, Ui, UiBuilder,
+    Vec2,
+};
 
 use crate::theme;
 
@@ -31,14 +34,25 @@ pub fn diff_view(ui: &mut Ui, src: &impl LineSource) {
     let font = TextStyle::Monospace.resolve(ui.style());
     let row_h = ui.text_style_height(&TextStyle::Monospace);
     let total = src.line_count();
-    let viewport_rect = ui.available_rect_before_wrap();
+    let available = ui.available_size_before_wrap();
+    if available.x <= 0.0 || available.y <= 0.0 {
+        return;
+    }
+    let (viewport_rect, _) = ui.allocate_exact_size(available, Sense::hover());
 
     ui.painter().rect_filled(viewport_rect, 0.0, theme::INSET);
+    let mut viewport_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(viewport_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    viewport_ui.set_clip_rect(viewport_rect);
+    viewport_ui.spacing_mut().item_spacing.y = 0.0;
 
     ScrollArea::vertical()
+        .min_scrolled_height(viewport_rect.height())
         .auto_shrink([false, false])
-        .show_rows(ui, row_h, total, |ui, range| {
-            ui.spacing_mut().item_spacing.y = 0.0;
+        .show_rows(&mut viewport_ui, row_h, total, |ui, range| {
             for i in range {
                 let line = src.line(i);
                 let mut job = LayoutJob::default();

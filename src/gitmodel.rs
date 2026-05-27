@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use git2::{Delta, DiffFormat, DiffOptions, Index, Oid, Repository, Signature};
+use git2::{Delta, DiffFormat, DiffOptions, Oid, Repository, Signature, Status, StatusOptions};
 
 pub struct CommitInfo {
     pub oid: Oid,
@@ -16,6 +16,53 @@ pub struct CommitInfo {
 pub struct FileChange {
     pub path: String,
     pub status: char,
+}
+
+/// A cheap-ish signature for repo state that affects the Diff page.
+///
+/// Includes HEAD, index metadata, status entries, and working-tree file mtimes
+/// for changed paths. This is used to notice external `git commit` / `git add`
+/// / file edits without constantly rebuilding the full visible diff model.
+pub fn state_token(repo: &Repository) -> Result<String, git2::Error> {
+    let mut token = String::new();
+    token.push_str("HEAD=");
+    if let Ok(head) = repo.head() {
+        if let Some(target) = head.target() {
+            token.push_str(&target.to_string());
+        } else if let Some(name) = head.name() {
+            token.push_str(name);
+        }
+    } else {
+        token.push_str("unborn");
+    }
+
+    if let Ok(index_path) = repo.path().join("index").metadata() {
+        token.push_str("|index=");
+        token.push_str(&metadata_token(&index_path));
+    }
+
+    let workdir = repo.workdir().map(Path::to_path_buf);
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true);
+    let statuses = repo.statuses(Some(&mut opts))?;
+    for entry in statuses.iter() {
+        let path = entry.path().unwrap_or("");
+        token.push('|');
+        token.push_str(path);
+        token.push(':');
+        token.push_str(&status_token(entry.status()));
+        if let Some(root) = &workdir {
+            if let Ok(meta) = root.join(path).metadata() {
+                token.push(':');
+                token.push_str(&metadata_token(&meta));
+            }
+        }
+    }
+
+    Ok(token)
 }
 
 /// List local working tree/index changes relative to HEAD.
@@ -58,7 +105,7 @@ pub fn commit_paths(
         let tree = parent.tree()?;
         index.read_tree(&tree)?;
     } else {
-        index = Index::new()?;
+        index.clear()?;
     }
 
     for path in paths {
@@ -259,6 +306,102 @@ fn status_char(s: Delta) -> char {
         Delta::Copied => 'C',
         Delta::Typechange => 'T',
         _ => '?',
+    }
+}
+
+fn status_token(s: Status) -> String {
+    let mut out = String::new();
+    if s.is_index_new() {
+        out.push('A');
+    }
+    if s.is_index_modified() {
+        out.push('M');
+    }
+    if s.is_index_deleted() {
+        out.push('D');
+    }
+    if s.is_index_renamed() {
+        out.push('R');
+    }
+    if s.is_index_typechange() {
+        out.push('T');
+    }
+    if s.is_wt_new() {
+        out.push('?');
+    }
+    if s.is_wt_modified() {
+        out.push('m');
+    }
+    if s.is_wt_deleted() {
+        out.push('d');
+    }
+    if s.is_wt_renamed() {
+        out.push('r');
+    }
+    if s.is_wt_typechange() {
+        out.push('t');
+    }
+    if s.is_conflicted() {
+        out.push('!');
+    }
+    out
+}
+
+fn metadata_token(meta: &std::fs::Metadata) -> String {
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}:{modified}", meta.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn commits_selected_file_in_unborn_repo() {
+        let dir = test_dir("codez-unborn-commit");
+        fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        fs::write(dir.join("hello.txt"), "hello\n").unwrap();
+
+        let oid = commit_paths(&repo, &["hello.txt".to_string()], "initial").unwrap();
+        let commit = repo.find_commit(oid).unwrap();
+        let tree = commit.tree().unwrap();
+        assert!(tree.get_path(Path::new("hello.txt")).is_ok());
+        assert_eq!(commit.parent_count(), 0);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn state_token_changes_after_commit() {
+        let dir = test_dir("codez-state-token");
+        fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        fs::write(dir.join("hello.txt"), "hello\n").unwrap();
+        commit_paths(&repo, &["hello.txt".to_string()], "initial").unwrap();
+        let before = state_token(&repo).unwrap();
+
+        fs::write(dir.join("hello.txt"), "hello again\n").unwrap();
+        commit_paths(&repo, &["hello.txt".to_string()], "update").unwrap();
+        let after = state_token(&repo).unwrap();
+
+        assert_ne!(before, after);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{}-{unique}", std::process::id()))
     }
 }
 
