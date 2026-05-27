@@ -99,7 +99,9 @@ fn attach_menu(
     let dir = if is_dir {
         path.to_path_buf()
     } else {
-        path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf())
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
     };
     fn item(ui: &mut egui::Ui, label: &str, act: TreeAction, out: &mut Option<TreeAction>) {
         if ui.button(label).clicked() {
@@ -109,11 +111,31 @@ fn attach_menu(
     }
     response.context_menu(|ui| {
         item(ui, "New File…", TreeAction::NewFile(dir.clone()), action);
-        item(ui, "New Folder…", TreeAction::NewFolder(dir.clone()), action);
+        item(
+            ui,
+            "New Folder…",
+            TreeAction::NewFolder(dir.clone()),
+            action,
+        );
         ui.separator();
-        item(ui, "Rename…", TreeAction::Rename(path.to_path_buf()), action);
-        item(ui, "Duplicate", TreeAction::Duplicate(path.to_path_buf()), action);
-        item(ui, "Move to Trash", TreeAction::Delete(path.to_path_buf()), action);
+        item(
+            ui,
+            "Rename…",
+            TreeAction::Rename(path.to_path_buf()),
+            action,
+        );
+        item(
+            ui,
+            "Duplicate",
+            TreeAction::Duplicate(path.to_path_buf()),
+            action,
+        );
+        item(
+            ui,
+            "Move to Trash",
+            TreeAction::Delete(path.to_path_buf()),
+            action,
+        );
         ui.separator();
         item(ui, "Copy", TreeAction::CopyFile(path.to_path_buf()), action);
         ui.add_enabled_ui(can_paste, |ui| {
@@ -123,11 +145,31 @@ fn attach_menu(
             }
         });
         ui.separator();
-        item(ui, "Reveal in Finder", TreeAction::RevealInFinder(path.to_path_buf()), action);
-        item(ui, "Open in Terminal", TreeAction::OpenInTerminal(dir.clone()), action);
+        item(
+            ui,
+            "Reveal in Finder",
+            TreeAction::RevealInFinder(path.to_path_buf()),
+            action,
+        );
+        item(
+            ui,
+            "Open in Terminal",
+            TreeAction::OpenInTerminal(dir.clone()),
+            action,
+        );
         ui.separator();
-        item(ui, "Copy Path", TreeAction::CopyPath(path.to_path_buf()), action);
-        item(ui, "Copy Relative Path", TreeAction::CopyRelativePath(path.to_path_buf()), action);
+        item(
+            ui,
+            "Copy Path",
+            TreeAction::CopyPath(path.to_path_buf()),
+            action,
+        );
+        item(
+            ui,
+            "Copy Relative Path",
+            TreeAction::CopyRelativePath(path.to_path_buf()),
+            action,
+        );
     });
 }
 

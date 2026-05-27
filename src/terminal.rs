@@ -8,9 +8,9 @@
 //! grid with egui's `Painter`, and translating egui key/text events back into
 //! the byte sequences a terminal expects.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
-use std::path::PathBuf;
 
 use alacritty_terminal::event::{Event, EventListener, Notify, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
@@ -115,7 +115,11 @@ impl Terminal {
 
         let (event_tx, event_rx) = mpsc::channel();
         let proxy = EventProxy(event_tx);
-        let term = Term::new(term::Config::default(), &Grid { cols, lines }, proxy.clone());
+        let term = Term::new(
+            term::Config::default(),
+            &Grid { cols, lines },
+            proxy.clone(),
+        );
         let term = Arc::new(FairMutex::new(term));
 
         let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)?;
@@ -184,8 +188,7 @@ impl Terminal {
         let font = FontId::monospace(TextStyle::Monospace.resolve(ui.style()).size);
         let cell = ui.fonts(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
 
-        let (response, painter) =
-            ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = response.rect;
 
         self.resize(rect.size(), cell);
@@ -347,13 +350,7 @@ impl Terminal {
         }
     }
 
-    fn begin_selection(
-        &self,
-        ty: SelectionType,
-        resp: &egui::Response,
-        rect: Rect,
-        cell: Vec2,
-    ) {
+    fn begin_selection(&self, ty: SelectionType, resp: &egui::Response, rect: Rect, cell: Vec2) {
         if let Some(pos) = resp.interact_pointer_pos() {
             let point = self.point_at(pos, rect, cell);
             let side = self.side_at(pos, cell);
@@ -364,7 +361,8 @@ impl Terminal {
     /// Map a screen position to a grid point, accounting for scrollback offset.
     fn point_at(&self, pos: Pos2, rect: Rect, cell: Vec2) -> Point {
         let col = (((pos.x - rect.min.x) / cell.x) as i32).clamp(0, self.cols as i32 - 1) as usize;
-        let line = (((pos.y - rect.min.y) / cell.y) as i32).clamp(0, self.lines as i32 - 1) as usize;
+        let line =
+            (((pos.y - rect.min.y) / cell.y) as i32).clamp(0, self.lines as i32 - 1) as usize;
         let offset = self.term.lock().grid().display_offset();
         viewport_to_point(offset, Point::new(line, Column(col)))
     }
@@ -512,7 +510,9 @@ impl Terminal {
             if flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
                 fg = fg.linear_multiply(0.7);
             }
-            let is_selected = selection.as_ref().is_some_and(|r| r.contains(indexed.point));
+            let is_selected = selection
+                .as_ref()
+                .is_some_and(|r| r.contains(indexed.point));
             if flags.contains(Flags::INVERSE) || is_selected {
                 std::mem::swap(&mut fg, &mut bg);
             }

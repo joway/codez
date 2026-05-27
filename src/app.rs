@@ -65,6 +65,11 @@ pub struct CodezApp {
     show_shortcuts: bool,
     /// Startup prompt offering to install the `codez` CLI.
     show_cli_prompt: bool,
+    update_rx:
+        Option<std::sync::mpsc::Receiver<Result<Option<crate::updater::UpdateInfo>, String>>>,
+    update_check_started: bool,
+    update_available: Option<crate::updater::UpdateInfo>,
+    update_dismissed_version: Option<String>,
 
     // --- File-tree operations ---
     file_clipboard: Option<PathBuf>,
@@ -150,6 +155,10 @@ impl CodezApp {
             show_shortcuts: false,
             // Offer to install the CLI on first launches, until installed or dismissed.
             show_cli_prompt: !crate::cli::installed() && !crate::cli::prompt_dismissed(),
+            update_rx: None,
+            update_check_started: false,
+            update_available: None,
+            update_dismissed_version: None,
             file_clipboard: None,
             prompt: None,
             prompt_text: String::new(),
@@ -184,7 +193,10 @@ impl eframe::App for CodezApp {
         // ⌘⇧F → Find in Files. Consume before the editor sees the key (its ⌘F
         // handler ignores Shift and would otherwise also fire).
         if ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::F)
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::F,
+            )
         }) {
             self.mode = Mode::FileBrowser;
             self.project_search.reveal();
@@ -192,7 +204,10 @@ impl eframe::App for CodezApp {
         // ⌘⇧P command palette, ⌘P file quick-open. Consume so the editor (which
         // ignores them anyway) never sees the keys.
         if ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P)
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::P,
+            )
         }) {
             self.palette.open_commands();
         } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
@@ -201,6 +216,7 @@ impl eframe::App for CodezApp {
             }
         }
         self.handle_palette(ctx);
+        self.poll_update(ctx);
         self.check_external_change();
         self.settings.apply(ctx);
         // Reflect unsaved-changes state in the title bar.
@@ -221,6 +237,7 @@ impl eframe::App for CodezApp {
         self.file_prompt_ui(ctx);
         self.shortcuts_ui(ctx);
         self.cli_prompt_ui(ctx);
+        self.update_prompt_ui(ctx);
 
         // Native menu clicks don't wake the window, so poll a few times a second.
         ctx.request_repaint_after(std::time::Duration::from_millis(150));
@@ -335,8 +352,7 @@ impl CodezApp {
                 ui.add_space(4.0);
                 ui.label("Open folders from the terminal with the codez command.");
                 ui.label(
-                    RichText::new("e.g.   codez .    or    codez <path>")
-                        .color(theme::TEXT_DIM),
+                    RichText::new("e.g.   codez .    or    codez <path>").color(theme::TEXT_DIM),
                 );
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
@@ -356,6 +372,84 @@ impl CodezApp {
                 });
                 ui.add_space(4.0);
             });
+    }
+
+    /// Start one background update check per app launch and collect the result.
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        if !self.update_check_started {
+            self.update_check_started = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::updater::check());
+                ctx.request_repaint();
+            });
+            self.update_rx = Some(rx);
+        }
+
+        if let Some(rx) = &self.update_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.update_rx = None;
+                if let Ok(Some(update)) = result {
+                    if self.update_dismissed_version.as_deref() != Some(update.version.as_str()) {
+                        self.update_available = Some(update);
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_prompt_ui(&mut self, ctx: &egui::Context) {
+        let Some(update) = self.update_available.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Update available")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "CodeZ {} is available. You are running {}.",
+                        update.version,
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                    .color(theme::TEXT),
+                );
+                if let Some(notes) = &update.notes {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(notes).color(theme::TEXT_DIM));
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if theme::pill_button(ui, "Download") {
+                        let _ = std::process::Command::new("open")
+                            .arg(&update.download_url)
+                            .spawn();
+                        self.update_available = None;
+                    }
+                    if let Some(url) = &update.release_notes_url {
+                        ui.add_space(8.0);
+                        if theme::pill_button(ui, "Release notes") {
+                            let _ = std::process::Command::new("open").arg(url).spawn();
+                        }
+                    }
+                    ui.add_space(8.0);
+                    if theme::pill_button(ui, "Not now") {
+                        self.update_dismissed_version = Some(update.version.clone());
+                        self.update_available = None;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+
+        if !open {
+            self.update_dismissed_version = Some(update.version);
+            self.update_available = None;
+        }
     }
 
     /// Drain native menu events. Plain menu items (no checkmarks) so there is no
@@ -813,7 +907,10 @@ impl CodezApp {
                 }
             }
             RevealInFinder(path) => {
-                let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+                let _ = std::process::Command::new("open")
+                    .arg("-R")
+                    .arg(&path)
+                    .spawn();
             }
             OpenInTerminal(dir) => {
                 let _ = std::process::Command::new("open")
@@ -906,10 +1003,7 @@ impl CodezApp {
                 }
             }
             FilePrompt::Rename(path) => {
-                let dest = path
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join(&name);
+                let dest = path.parent().unwrap_or(Path::new(".")).join(&name);
                 if dest.exists() && dest != *path {
                     Err(already_exists())
                 } else {
@@ -1023,11 +1117,13 @@ impl CodezApp {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Repository".to_string());
                 diff_sidebar_header(ui, &repo_name, &self.git_status);
-                let branch = self
-                    .repo
-                    .as_ref()
-                    .and_then(gitmodel::current_branch);
-                if push_toolbar(ui, branch.as_deref(), self.push_rx.is_some(), &self.push_status) {
+                let branch = self.repo.as_ref().and_then(gitmodel::current_branch);
+                if push_toolbar(
+                    ui,
+                    branch.as_deref(),
+                    self.push_rx.is_some(),
+                    &self.push_status,
+                ) {
                     self.start_push(ui.ctx());
                 }
                 if let Some(tab) = diff_tab_bar(
@@ -1312,8 +1408,16 @@ fn push_toolbar(ui: &mut egui::Ui, branch: Option<&str>, pushing: bool, status: 
         };
         let enabled = branch.is_some() && !pushing;
         let width = (ui.available_width() - 28.0).max(80.0);
-        let button = egui::Button::new(RichText::new(label).color(theme::TEXT).size(font_size * 0.85))
-            .fill(if enabled { theme::SIDEBAR_SELECTED } else { theme::RAISED });
+        let button = egui::Button::new(
+            RichText::new(label)
+                .color(theme::TEXT)
+                .size(font_size * 0.85),
+        )
+        .fill(if enabled {
+            theme::SIDEBAR_SELECTED
+        } else {
+            theme::RAISED
+        });
         clicked = ui
             .add_enabled(enabled, button.min_size(Vec2::new(width, 30.0)))
             .clicked();
@@ -1865,7 +1969,11 @@ fn session_row(
         Align2::LEFT_TOP,
         ellipsize(ui, &second, second_font.clone(), avail),
         second_font,
-        if selected { theme::TEXT } else { theme::TEXT_DIM },
+        if selected {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM
+        },
     );
     response.on_hover_text(&session.id)
 }
@@ -2097,7 +2205,11 @@ fn terminal_tab_bar(
             Align2::CENTER_CENTER,
             "×",
             FontId::proportional(font_size * 0.95),
-            if close_resp.hovered() { theme::TEXT } else { fg },
+            if close_resp.hovered() {
+                theme::TEXT
+            } else {
+                fg
+            },
         );
 
         if close_resp.clicked() {
@@ -2189,8 +2301,12 @@ fn file_header(ui: &mut egui::Ui, path: &Path, status: &str, dirty: bool) {
     ui.horizontal(|ui| {
         // VS Code-style unsaved dot before the filename.
         if dirty {
-            ui.label(RichText::new("●").color(theme::YELLOW).size(font_size * 0.7))
-                .on_hover_text("Unsaved changes");
+            ui.label(
+                RichText::new("●")
+                    .color(theme::YELLOW)
+                    .size(font_size * 0.7),
+            )
+            .on_hover_text("Unsaved changes");
         }
         ui.label(
             RichText::new(path.to_string_lossy())

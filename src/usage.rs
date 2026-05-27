@@ -122,15 +122,24 @@ fn claude() -> Option<Limits> {
 /// The Claude Code OAuth access token, from the macOS keychain or the dotfile.
 fn claude_token() -> Option<String> {
     let raw = Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .or_else(|| {
             let home = std::env::var_os("HOME")?;
-            std::fs::read_to_string(PathBuf::from(home).join(".claude").join(".credentials.json"))
-                .ok()
+            std::fs::read_to_string(
+                PathBuf::from(home)
+                    .join(".claude")
+                    .join(".credentials.json"),
+            )
+            .ok()
         })?;
     let key = "\"accessToken\":\"";
     let start = raw.find(key)? + key.len();

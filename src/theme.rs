@@ -28,9 +28,7 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, tooltip: &str) -> bool {
 /// lifts on hover. Returns true when clicked.
 pub fn pill_button(ui: &mut Ui, label: &str) -> bool {
     let font = FontId::proportional(13.0);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font, TEXT);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, TEXT);
     let size = galley.size();
     let (rect, resp) = ui.allocate_exact_size(size + Vec2::new(20.0, 10.0), Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);

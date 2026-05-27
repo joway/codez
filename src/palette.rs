@@ -186,7 +186,11 @@ impl Palette {
             self.selected = self.selected.min(entries.len() - 1);
         }
 
-        let title = if self.commands { "Command Palette" } else { "Go to File" };
+        let title = if self.commands {
+            "Command Palette"
+        } else {
+            "Go to File"
+        };
         egui::Window::new(title)
             .title_bar(false)
             .collapsible(false)

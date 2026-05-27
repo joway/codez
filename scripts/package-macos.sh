@@ -21,10 +21,18 @@ BUNDLE_ID="com.codez.app"
 ICON_SRC="assets/logo-1024.png"        # source logo; .icns is generated from it
 ICON_FALLBACK="assets/CodeZ.icns"      # used if the source logo is missing
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+SIGN_IDENTITY="${CODEZ_SIGN_IDENTITY:-}"
+NOTARY_PROFILE="${CODEZ_NOTARY_PROFILE:-}"
 
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"
 CONTENTS="$APP/Contents"
+
+find_sign_identity() {
+  local pattern="$1"
+  security find-identity -v -p codesigning 2>/dev/null | \
+    grep -F "$pattern" | sed -E 's/.*"([^"]+)".*/\1/' | head -1
+}
 
 echo "==> Building $APP_NAME $VERSION (universal: arm64 + x86_64)"
 TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
@@ -84,10 +92,31 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc sign so the app launches locally without "damaged/unverified" errors.
-echo "==> Ad-hoc code signing"
-codesign --force --deep --sign - "$APP" 2>/dev/null || \
-  echo "    (codesign unavailable — skipping; app still runs from Finder)"
+echo "==> Code signing"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$(find_sign_identity "Developer ID Application:")"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$(find_sign_identity "Apple Development:")"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  echo "error: no code signing identity found."
+  echo "Install a Developer ID Application certificate, or set CODEZ_SIGN_IDENTITY."
+  echo "Available identities:"
+  security find-identity -v -p codesigning || true
+  exit 1
+fi
+echo "    identity: $SIGN_IDENTITY"
+if [[ "$SIGN_IDENTITY" != Developer\ ID\ Application:* ]]; then
+  echo "    warning: not a Developer ID Application certificate; this is suitable for local/test builds,"
+  echo "             but public downloads should use Developer ID signing plus notarization."
+fi
+CODESIGN_TIMESTAMP=()
+if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
+  CODESIGN_TIMESTAMP=(--timestamp)
+fi
+codesign --force --deep --options runtime "${CODESIGN_TIMESTAMP[@]}" --sign "$SIGN_IDENTITY" "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
 echo "==> Creating .dmg"
 DMG="$DIST/$APP_NAME-$VERSION.dmg"
@@ -98,10 +127,29 @@ rm -f "$DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
 
+echo "==> Signing .dmg"
+codesign --force "${CODESIGN_TIMESTAMP[@]}" --sign "$SIGN_IDENTITY" "$DMG"
+codesign --verify --verbose=2 "$DMG"
+
+if [[ -n "$NOTARY_PROFILE" ]]; then
+  echo "==> Notarizing .dmg"
+  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$DMG"
+else
+  echo "==> Skipping notarization"
+  echo "    Set CODEZ_NOTARY_PROFILE=<notarytool keychain profile> to notarize."
+fi
+
+echo "==> Updating website download"
+mkdir -p "$ROOT/website/downloads"
+cp "$DMG" "$ROOT/website/downloads/$APP_NAME-latest.dmg"
+cp "$DMG" "$ROOT/website/downloads/$APP_NAME-$VERSION.dmg"
+
 echo
 echo "Done:"
 echo "  $APP"
 echo "  $DMG"
+echo "  $ROOT/website/downloads/$APP_NAME-latest.dmg"
 echo
 echo "Install: open the .dmg and drag $APP_NAME to Applications."
 echo "CLI:     ./scripts/install-cli.sh   (adds a 'codez' command to open it)"

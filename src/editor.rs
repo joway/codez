@@ -344,8 +344,8 @@ impl Editor {
                 shift -= (b - a) as isize;
             } else if a > 0 {
                 let prev = self.rope.char(a - 1);
-                let pair = a < self.rope.len_chars()
-                    && matching_close(prev) == Some(self.rope.char(a));
+                let pair =
+                    a < self.rope.len_chars() && matching_close(prev) == Some(self.rope.char(a));
                 if pair {
                     self.rope.remove(a - 1..a + 1);
                     self.carets[i] = Caret::point(a - 1);
@@ -441,9 +441,17 @@ impl Editor {
                 self.rope.insert(a, &open.to_string());
                 let forward = self.carets[i].head >= self.carets[i].anchor;
                 self.carets[i] = if forward {
-                    Caret { anchor: a + 1, head: b + 1, goal_col: None }
+                    Caret {
+                        anchor: a + 1,
+                        head: b + 1,
+                        goal_col: None,
+                    }
                 } else {
-                    Caret { anchor: b + 1, head: a + 1, goal_col: None }
+                    Caret {
+                        anchor: b + 1,
+                        head: a + 1,
+                        goal_col: None,
+                    }
                 };
             } else {
                 self.rope.insert(a, &format!("{open}{close}"));
@@ -1541,7 +1549,12 @@ impl Editor {
                     // Inline IME composition at the primary caret.
                     if ci == primary && !view.preedit.is_empty() {
                         let pre = ui.fonts(|f| {
-                            f.layout(view.preedit.clone(), font.clone(), theme::TEXT, f32::INFINITY)
+                            f.layout(
+                                view.preedit.clone(),
+                                font.clone(),
+                                theme::TEXT,
+                                f32::INFINITY,
+                            )
                         });
                         let w = pre.size().x;
                         painter.rect_filled(

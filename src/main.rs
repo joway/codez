@@ -15,6 +15,7 @@ mod settings;
 mod terminal;
 mod textview;
 mod theme;
+mod updater;
 mod usage;
 
 use std::path::PathBuf;

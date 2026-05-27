@@ -49,8 +49,9 @@ fn install_with_admin(target: &str, contents: &str) -> Result<(), String> {
     std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
     let tmp = tmp.to_string_lossy().into_owned();
 
-    let cmd =
-        format!("mkdir -p /usr/local/bin && /bin/cp '{tmp}' '{target}' && /bin/chmod 755 '{target}'");
+    let cmd = format!(
+        "mkdir -p /usr/local/bin && /bin/cp '{tmp}' '{target}' && /bin/chmod 755 '{target}'"
+    );
     let script = format!(
         "do shell script \"{}\" with administrator privileges",
         cmd.replace('\\', "\\\\").replace('"', "\\\"")
