@@ -221,6 +221,9 @@ impl eframe::App for CodezApp {
                 self.palette.open_files(&root);
             }
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+            self.new_terminal_shortcut(ctx);
+        }
         self.handle_terminal_tab_shortcuts(ctx);
         self.handle_palette(ctx);
         self.poll_update(ctx);
@@ -326,6 +329,7 @@ impl CodezApp {
                                 ("⌘S", "Save file"),
                                 ("⌘,", "Settings"),
                                 ("⌘P", "Quick-open file"),
+                                ("⌘N", "New terminal"),
                                 ("⌘⇧P", "Command palette"),
                                 ("⌘⇧F", "Find in files"),
                             ],
@@ -598,6 +602,14 @@ impl CodezApp {
         if let Some(tab) = self.terminals.get_mut(index) {
             tab.terminal.request_focus();
         }
+    }
+
+    fn new_terminal_shortcut(&mut self, ctx: &egui::Context) {
+        if self.root.is_none() {
+            return;
+        }
+        self.mode = Mode::Agent;
+        self.open_blank_terminal(ctx);
     }
 
     // ---------------- Agent mode ----------------
