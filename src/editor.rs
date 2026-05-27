@@ -20,6 +20,7 @@ use ropey::Rope;
 use crate::highlight::{self, Lang};
 use crate::theme;
 
+const EDITOR_SCROLL_ID: &str = "editor_scroll";
 const CARET_COLOR: Color32 = Color32::from_rgb(0xe6, 0xed, 0xf3);
 const DOUBLE_CLICK_SECONDS: f64 = 0.35;
 
@@ -109,6 +110,7 @@ pub struct Editor {
     last_click_time: f64,
     last_click_idx: Option<usize>,
     pending_scroll_to: Option<usize>,
+    scroll_y: f32,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last_kind: Option<EditKind>,
@@ -142,6 +144,7 @@ impl Editor {
             last_click_time: f64::NEG_INFINITY,
             last_click_idx: None,
             pending_scroll_to: None,
+            scroll_y: 0.0,
             undo: Vec::new(),
             redo: Vec::new(),
             last_kind: None,
@@ -264,6 +267,7 @@ impl Editor {
         self.dragging = false;
         self.last_kind = None;
         self.dirty = self.is_dirty();
+        self.scroll_to_primary_caret();
     }
 
     fn begin_edit(&mut self, kind: EditKind) {
@@ -288,6 +292,12 @@ impl Editor {
         if let Some(snapshot) = self.redo.pop() {
             self.undo.push(self.current_snapshot());
             self.restore_snapshot(snapshot);
+        }
+    }
+
+    fn scroll_to_primary_caret(&mut self) {
+        if let Some(caret) = self.carets.last() {
+            self.pending_scroll_to = Some(caret.head);
         }
     }
 
@@ -325,6 +335,9 @@ impl Editor {
         }
         self.dirty = true;
         self.normalize();
+        if s.contains('\n') {
+            self.scroll_to_primary_caret();
+        }
     }
 
     fn backspace(&mut self) {
@@ -524,6 +537,7 @@ impl Editor {
         }
         self.dirty = true;
         self.normalize();
+        self.scroll_to_primary_caret();
     }
 
     // ---- movement ----
@@ -554,12 +568,14 @@ impl Editor {
     fn move_v(&mut self, dir: isize, extend: bool) {
         self.last_kind = None;
         let last_line = self.rope.len_lines().saturating_sub(1);
+        let mut moved = false;
         for i in 0..self.carets.len() {
             let c = self.carets[i];
             let (line, col) = self.idx_to_lc(c.head);
             let goal = c.goal_col.unwrap_or(col);
             let nl = (line as isize + dir).clamp(0, last_line as isize) as usize;
             let new_head = self.lc_to_idx(nl, goal);
+            moved |= new_head != c.head;
             self.carets[i].head = new_head;
             if !extend {
                 self.carets[i].anchor = new_head;
@@ -567,6 +583,9 @@ impl Editor {
             self.carets[i].goal_col = Some(goal);
         }
         self.normalize();
+        if moved {
+            self.scroll_to_primary_caret();
+        }
     }
 
     fn move_home(&mut self, extend: bool) {
@@ -901,6 +920,7 @@ impl Editor {
         }
         self.carets = next;
         self.dirty = true;
+        self.scroll_to_primary_caret();
     }
 
     fn insert_line_before(&mut self) {
@@ -925,6 +945,7 @@ impl Editor {
         }
         self.carets = next;
         self.dirty = true;
+        self.scroll_to_primary_caret();
     }
 
     fn toggle_line_comment(&mut self) {
@@ -1428,9 +1449,21 @@ impl Editor {
         let num_w = ((total.max(1) as f32).log10().floor() as usize) + 1;
         let gutter_w = (num_w as f32 + 2.0) * char_w + 6.0;
         let scroll_to = self.pending_scroll_to.take();
-        let scroll_offset = scroll_to.map(|idx| {
+        let scroll_offset = scroll_to.and_then(|idx| {
             let line = self.rope.char_to_line(idx.min(self.rope.len_chars()));
-            (line as f32 * row_step - ui.available_height() * 0.45).max(0.0)
+            let caret_top = line as f32 * row_step;
+            let caret_bottom = caret_top + row_step;
+            let visible_h = ui.available_height().max(row_step);
+            let current = self.scroll_y;
+            let visible_top = current;
+            let visible_bottom = current + visible_h;
+            if caret_bottom > visible_bottom {
+                Some((caret_bottom - visible_h).max(0.0))
+            } else if caret_top < visible_top {
+                Some(caret_top.max(0.0))
+            } else {
+                None
+            }
         });
 
         let mut hit: Option<usize> = None;
@@ -1438,6 +1471,7 @@ impl Editor {
         let view = &*self; // immutable view for the render closure
 
         let mut scroll_area = egui::ScrollArea::both()
+            .id_salt(EDITOR_SCROLL_ID)
             .auto_shrink([false, false])
             .drag_to_scroll(false);
         if let Some(offset) = scroll_offset {
@@ -1593,6 +1627,7 @@ impl Editor {
                 }
             }
         });
+        self.scroll_y = scroll_out.state.offset.y;
         if (p.pressed || p.down) && hit.is_none() {
             if let Some(pos) = p.pos {
                 if scroll_out.inner_rect.contains(pos) && total > 0 {

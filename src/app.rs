@@ -261,8 +261,19 @@ impl CodezApp {
                     ui.add_space(PANEL_LEFT_PAD);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.label(RichText::new("Code").color(theme::TEXT).strong());
-                        ui.label(RichText::new("Z").color(theme::TEXT_MUTED).strong());
+                        let brand_font = FontId::proportional(18.0);
+                        ui.label(
+                            RichText::new("Code")
+                                .font(brand_font.clone())
+                                .color(theme::TEXT)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new("Z")
+                                .font(brand_font)
+                                .color(theme::TEXT_MUTED)
+                                .strong(),
+                        );
                     });
                     ui.add_space(7.0);
                     if help_icon(ui) {
