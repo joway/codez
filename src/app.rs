@@ -276,6 +276,16 @@ impl CodezApp {
                         );
                     });
                     ui.add_space(7.0);
+                    if let Some(root) = self.root.as_ref() {
+                        let folder = root
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| root.display().to_string());
+                        ui.label(RichText::new("·").color(theme::TEXT_MUTED));
+                        ui.label(RichText::new(folder).color(theme::TEXT_DIM))
+                            .on_hover_text(root.display().to_string());
+                        ui.add_space(7.0);
+                    }
                     if help_icon(ui) {
                         self.show_shortcuts = true;
                     }

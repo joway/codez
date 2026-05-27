@@ -580,9 +580,11 @@ fn key_to_bytes(key: Key, m: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
         Key::Tab if m.shift => b"\x1b[Z".as_slice(),
         Key::Tab => b"\t",
         Key::Backspace => b"\x7f",
+        // macOS labels the backspace key as "delete"; on some keyboards/OS
+        // paths egui reports that physical key as Delete instead of Backspace.
+        Key::Delete => b"\x7f",
         Key::Escape => b"\x1b",
         Key::Insert => b"\x1b[2~".as_slice(),
-        Key::Delete => b"\x1b[3~".as_slice(),
         Key::PageUp => b"\x1b[5~".as_slice(),
         Key::PageDown => b"\x1b[6~".as_slice(),
         Key::Home if app_cursor => b"\x1bOH".as_slice(),

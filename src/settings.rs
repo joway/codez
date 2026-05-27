@@ -12,6 +12,12 @@ const CJK_FONTS: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
 ];
 
+const SYMBOL_FONTS: &[&str] = &[
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/System/Library/Fonts/CJKSymbolsFallback.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UiFont {
     BuiltIn,
@@ -243,6 +249,18 @@ impl Settings {
                         .push("cjk".to_owned());
                 }
                 break;
+            }
+        }
+
+        for (i, path) in SYMBOL_FONTS.iter().enumerate() {
+            if let Ok(bytes) = std::fs::read(path) {
+                let name = format!("symbols_{i}");
+                fonts
+                    .font_data
+                    .insert(name.clone(), FontData::from_owned(bytes).into());
+                for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+                    fonts.families.entry(fam).or_default().push(name.clone());
+                }
             }
         }
 
