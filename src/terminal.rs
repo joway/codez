@@ -106,6 +106,10 @@ impl Terminal {
         };
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        // Finder-launched .app bundles do not inherit the terminal environment
+        // that `cargo run` has. Seed the PTY environment explicitly so shells
+        // and line editors get a real terminal type instead of an unset/dumb one.
+        tty::setup_env();
         let pty_options = tty::Options {
             shell: Some(tty::Shell::new(shell, vec!["-l".into(), "-i".into()])),
             working_directory: Some(working_dir),
