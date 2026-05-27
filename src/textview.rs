@@ -5,11 +5,12 @@
 //! diff size. Rows are tinted green/red by +/- with marker coloring.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use egui::text::LayoutJob;
 use egui::{
-    Align, Color32, Layout, Pos2, Rect, ScrollArea, Sense, TextFormat, TextStyle, Ui, UiBuilder,
-    Vec2,
+    Align, Align2, Color32, Layout, Pos2, Rect, ScrollArea, Sense, TextFormat, TextStyle, Ui,
+    UiBuilder, Vec2,
 };
 
 use crate::theme;
@@ -53,7 +54,11 @@ pub fn diff_view(ui: &mut Ui, src: &impl LineSource) {
         .min_scrolled_height(viewport_rect.height())
         .auto_shrink([false, false])
         .show_rows(&mut viewport_ui, row_h, total, |ui, range| {
-            for i in range {
+            let nums = diff_line_numbers(src, range.clone());
+            let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
+            let digits = total.max(1).to_string().len().max(3) as f32;
+            let gutter_w = (digits * 2.0 + 3.0) * char_w;
+            for (offset, i) in range.enumerate() {
                 let line = src.line(i);
                 let mut job = LayoutJob::default();
                 job.wrap.max_width = f32::INFINITY;
@@ -77,9 +82,131 @@ pub fn diff_view(ui: &mut Ui, src: &impl LineSource) {
                 );
                 ui.painter()
                     .rect_filled(bg_rect, 0.0, diff_bg(&line).unwrap_or(theme::INSET));
-                ui.painter().galley(rect.left_top(), galley, theme::TEXT);
+                paint_line_number(
+                    ui,
+                    rect,
+                    nums[offset].old,
+                    digits,
+                    font.clone(),
+                    rect.left() + 4.0,
+                );
+                paint_line_number(
+                    ui,
+                    rect,
+                    nums[offset].new,
+                    digits,
+                    font.clone(),
+                    rect.left() + 4.0 + (digits + 1.0) * char_w,
+                );
+                let sep_x = rect.left() + gutter_w - char_w;
+                ui.painter().vline(
+                    sep_x,
+                    rect.top()..=rect.bottom(),
+                    egui::Stroke::new(1.0, theme::BORDER),
+                );
+                ui.painter().galley(
+                    Pos2::new(rect.left() + gutter_w, rect.top()),
+                    galley,
+                    theme::TEXT,
+                );
             }
         });
+}
+
+#[derive(Clone, Copy, Default)]
+struct DiffLineNumber {
+    old: Option<usize>,
+    new: Option<usize>,
+}
+
+fn diff_line_numbers(src: &impl LineSource, range: Range<usize>) -> Vec<DiffLineNumber> {
+    let mut out = Vec::with_capacity(range.len());
+    let mut old_line: Option<usize> = None;
+    let mut new_line: Option<usize> = None;
+
+    for i in 0..range.end {
+        let line = src.line(i);
+        let text = line.as_ref();
+        let mut nums = DiffLineNumber::default();
+
+        if let Some((old_start, new_start)) = parse_hunk_header(text) {
+            old_line = Some(old_start);
+            new_line = Some(new_start);
+        } else if old_line.is_some() || new_line.is_some() {
+            match text.as_bytes().first().copied() {
+                Some(b'+') if !text.starts_with("+++") => {
+                    nums.new = new_line;
+                    if let Some(n) = &mut new_line {
+                        *n += 1;
+                    }
+                }
+                Some(b'-') if !text.starts_with("---") => {
+                    nums.old = old_line;
+                    if let Some(n) = &mut old_line {
+                        *n += 1;
+                    }
+                }
+                Some(b' ') => {
+                    nums.old = old_line;
+                    nums.new = new_line;
+                    if let Some(n) = &mut old_line {
+                        *n += 1;
+                    }
+                    if let Some(n) = &mut new_line {
+                        *n += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if i >= range.start {
+            out.push(nums);
+        }
+    }
+
+    out
+}
+
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    if !line.starts_with("@@ ") {
+        return None;
+    }
+    let old = parse_hunk_side(line, '-')?;
+    let new = parse_hunk_side(line, '+')?;
+    Some((old, new))
+}
+
+fn parse_hunk_side(line: &str, marker: char) -> Option<usize> {
+    let start = line.find(marker)? + marker.len_utf8();
+    let num: String = line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    num.parse().ok()
+}
+
+fn paint_line_number(
+    ui: &Ui,
+    rect: Rect,
+    line: Option<usize>,
+    digits: f32,
+    font: egui::FontId,
+    x: f32,
+) {
+    let Some(line) = line else {
+        return;
+    };
+    ui.painter().text(
+        Pos2::new(
+            x + digits * ui.fonts(|f| f.glyph_width(&font, '0')),
+            rect.top(),
+        ),
+        Align2::RIGHT_TOP,
+        line.to_string(),
+        font,
+        theme::TEXT_MUTED,
+    );
 }
 
 fn diff_bg(line: &str) -> Option<Color32> {

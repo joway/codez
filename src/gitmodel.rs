@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use git2::{Delta, DiffFormat, DiffOptions, Oid, Repository, Signature, Status, StatusOptions};
+use git2::{Delta, DiffFormat, DiffOptions, Oid, Repository, Signature};
 
 pub struct CommitInfo {
     pub oid: Oid,
@@ -18,51 +18,49 @@ pub struct FileChange {
     pub status: char,
 }
 
-/// A cheap-ish signature for repo state that affects the Diff page.
-///
-/// Includes HEAD, index metadata, status entries, and working-tree file mtimes
-/// for changed paths. This is used to notice external `git commit` / `git add`
-/// / file edits without constantly rebuilding the full visible diff model.
-pub fn state_token(repo: &Repository) -> Result<String, git2::Error> {
+pub struct RepoSnapshot {
+    pub local_changes: Vec<FileChange>,
+    pub commits: Vec<CommitInfo>,
+    pub token: String,
+}
+
+pub fn snapshot(root: &Path) -> Result<RepoSnapshot, git2::Error> {
+    let repo = Repository::discover(root)?;
+    let local_changes = workdir_changes(&repo)?;
+    let commits = list_commits(&repo, 500)?;
+    let token = snapshot_token(&repo, &local_changes, &commits);
+    Ok(RepoSnapshot {
+        local_changes,
+        commits,
+        token,
+    })
+}
+
+pub fn snapshot_token(repo: &Repository, changes: &[FileChange], commits: &[CommitInfo]) -> String {
     let mut token = String::new();
     token.push_str("HEAD=");
-    if let Ok(head) = repo.head() {
-        if let Some(target) = head.target() {
-            token.push_str(&target.to_string());
-        } else if let Some(name) = head.name() {
-            token.push_str(name);
-        }
+    if let Some(first) = commits.first() {
+        token.push_str(&first.oid.to_string());
     } else {
         token.push_str("unborn");
     }
-
     if let Ok(index_path) = repo.path().join("index").metadata() {
         token.push_str("|index=");
         token.push_str(&metadata_token(&index_path));
     }
-
-    let workdir = repo.workdir().map(Path::to_path_buf);
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .renames_head_to_index(true)
-        .renames_index_to_workdir(true);
-    let statuses = repo.statuses(Some(&mut opts))?;
-    for entry in statuses.iter() {
-        let path = entry.path().unwrap_or("");
-        token.push('|');
-        token.push_str(path);
-        token.push(':');
-        token.push_str(&status_token(entry.status()));
-        if let Some(root) = &workdir {
-            if let Ok(meta) = root.join(path).metadata() {
+    if let Some(root) = repo.workdir() {
+        for change in changes {
+            token.push('|');
+            token.push(change.status);
+            token.push(':');
+            token.push_str(&change.path);
+            if let Ok(meta) = root.join(&change.path).metadata() {
                 token.push(':');
                 token.push_str(&metadata_token(&meta));
             }
         }
     }
-
-    Ok(token)
+    token
 }
 
 /// List local working tree/index changes relative to HEAD.
@@ -309,44 +307,6 @@ fn status_char(s: Delta) -> char {
     }
 }
 
-fn status_token(s: Status) -> String {
-    let mut out = String::new();
-    if s.is_index_new() {
-        out.push('A');
-    }
-    if s.is_index_modified() {
-        out.push('M');
-    }
-    if s.is_index_deleted() {
-        out.push('D');
-    }
-    if s.is_index_renamed() {
-        out.push('R');
-    }
-    if s.is_index_typechange() {
-        out.push('T');
-    }
-    if s.is_wt_new() {
-        out.push('?');
-    }
-    if s.is_wt_modified() {
-        out.push('m');
-    }
-    if s.is_wt_deleted() {
-        out.push('d');
-    }
-    if s.is_wt_renamed() {
-        out.push('r');
-    }
-    if s.is_wt_typechange() {
-        out.push('t');
-    }
-    if s.is_conflicted() {
-        out.push('!');
-    }
-    out
-}
-
 fn metadata_token(meta: &std::fs::Metadata) -> String {
     let modified = meta
         .modified()
@@ -380,17 +340,35 @@ mod tests {
     }
 
     #[test]
-    fn state_token_changes_after_commit() {
+    fn snapshot_token_changes_after_commit() {
         let dir = test_dir("codez-state-token");
         fs::create_dir_all(&dir).unwrap();
         let repo = Repository::init(&dir).unwrap();
         fs::write(dir.join("hello.txt"), "hello\n").unwrap();
         commit_paths(&repo, &["hello.txt".to_string()], "initial").unwrap();
-        let before = state_token(&repo).unwrap();
+        let before = snapshot(&dir).unwrap().token;
 
         fs::write(dir.join("hello.txt"), "hello again\n").unwrap();
         commit_paths(&repo, &["hello.txt".to_string()], "update").unwrap();
-        let after = state_token(&repo).unwrap();
+        let after = snapshot(&dir).unwrap().token;
+
+        assert_ne!(before, after);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_token_changes_after_worktree_edit() {
+        let dir = test_dir("codez-worktree-token");
+        fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        fs::write(dir.join("hello.txt"), "hello\n").unwrap();
+        commit_paths(&repo, &["hello.txt".to_string()], "initial").unwrap();
+
+        fs::write(dir.join("hello.txt"), "first edit\n").unwrap();
+        let before = snapshot(&dir).unwrap().token;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(dir.join("hello.txt"), "second edit\n").unwrap();
+        let after = snapshot(&dir).unwrap().token;
 
         assert_ne!(before, after);
         fs::remove_dir_all(dir).unwrap();

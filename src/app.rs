@@ -98,7 +98,8 @@ pub struct CodezApp {
     /// Last time the Diff page re-probed a non-git folder for a new repo.
     git_recheck_at: std::time::Instant,
     git_watch_at: std::time::Instant,
-    git_state_token: Option<String>,
+    git_refresh_rx: Option<std::sync::mpsc::Receiver<Result<gitmodel::RepoSnapshot, String>>>,
+    git_snapshot_token: Option<String>,
 }
 
 /// One terminal tab in Agent mode.
@@ -178,7 +179,8 @@ impl CodezApp {
             agent_scan_at: std::time::Instant::now(),
             git_recheck_at: std::time::Instant::now(),
             git_watch_at: std::time::Instant::now(),
-            git_state_token: None,
+            git_refresh_rx: None,
+            git_snapshot_token: None,
         };
         if let Some(dir) = initial_dir {
             app.open_folder(&dir);
@@ -257,7 +259,11 @@ impl CodezApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(PANEL_LEFT_PAD);
-                    ui.label(RichText::new("CodeZ").color(theme::TEXT_DIM).strong());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label(RichText::new("Code").color(theme::TEXT).strong());
+                        ui.label(RichText::new("Z").color(theme::TEXT_MUTED).strong());
+                    });
                     ui.add_space(7.0);
                     if help_icon(ui) {
                         self.show_shortcuts = true;
@@ -435,12 +441,6 @@ impl CodezApp {
                             .spawn();
                         self.update_available = None;
                     }
-                    if let Some(url) = &update.release_notes_url {
-                        ui.add_space(8.0);
-                        if theme::pill_button(ui, "Release notes") {
-                            let _ = std::process::Command::new("open").arg(url).spawn();
-                        }
-                    }
                     ui.add_space(8.0);
                     if theme::pill_button(ui, "Not now") {
                         self.update_dismissed_version = Some(update.version.clone());
@@ -506,7 +506,8 @@ impl CodezApp {
         self.changes.clear();
         self.selected_change = None;
         self.diff_lines.clear();
-        self.git_state_token = None;
+        self.git_refresh_rx = None;
+        self.git_snapshot_token = None;
 
         // Drop any running terminals (sends shutdown) and rescan agent sessions.
         self.terminals.clear();
@@ -544,7 +545,11 @@ impl CodezApp {
                             commits.len()
                         );
                         self.commits = commits;
-                        self.git_state_token = gitmodel::state_token(&repo).ok();
+                        self.git_snapshot_token = Some(gitmodel::snapshot_token(
+                            &repo,
+                            &self.local_changes,
+                            &self.commits,
+                        ));
                         self.repo = Some(repo);
                     }
                     Err(e) => self.git_status = format!("git error: {e}"),
@@ -1362,34 +1367,65 @@ impl CodezApp {
                 }
                 Err(e) => self.git_status = format!("git error: {e}"),
             }
-            self.git_state_token = gitmodel::state_token(repo).ok();
+            self.git_snapshot_token = Some(gitmodel::snapshot_token(
+                repo,
+                &self.local_changes,
+                &self.commits,
+            ));
         }
     }
 
     fn poll_git_external_changes(&mut self, ctx: &egui::Context) {
         let interval = std::time::Duration::from_millis(1200);
+        if let Some(rx) = &self.git_refresh_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.git_refresh_rx = None;
+                if let Ok(snapshot) = result {
+                    self.apply_git_snapshot(snapshot);
+                }
+            }
+        }
+
         if self.git_watch_at.elapsed() < interval {
             ctx.request_repaint_after(interval);
             return;
         }
         self.git_watch_at = std::time::Instant::now();
 
-        let changed = self
-            .repo
-            .as_ref()
-            .and_then(|repo| gitmodel::state_token(repo).ok())
-            .is_some_and(|token| {
-                let changed = self.git_state_token.as_deref() != Some(token.as_str());
-                self.git_state_token = Some(token);
-                changed
-            });
-        if changed {
-            self.refresh_git_diff_state();
-            self.selected_commit = None;
-            self.selected_change = None;
-            self.diff_lines.clear();
+        if self.git_refresh_rx.is_none() {
+            if let Some(root) = self.root.clone() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let result = gitmodel::snapshot(&root).map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                    ctx.request_repaint();
+                });
+                self.git_refresh_rx = Some(rx);
+            }
         }
         ctx.request_repaint_after(interval);
+    }
+
+    fn apply_git_snapshot(&mut self, snapshot: gitmodel::RepoSnapshot) {
+        if self.git_snapshot_token.as_deref() == Some(snapshot.token.as_str()) {
+            return;
+        }
+
+        self.git_snapshot_token = Some(snapshot.token);
+        self.local_changes = snapshot.local_changes;
+        self.selected_commit_paths = self.local_changes.iter().map(|c| c.path.clone()).collect();
+        self.commits = snapshot.commits;
+        self.git_status = format!(
+            "{} local changes · {} commits",
+            self.local_changes.len(),
+            self.commits.len()
+        );
+        self.selected_local_change = None;
+        self.selected_commit = None;
+        self.selected_change = None;
+        self.changes.clear();
+        self.diff_lines.clear();
     }
 
     fn select_commit(&mut self, idx: usize) {

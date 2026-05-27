@@ -34,7 +34,6 @@ The manifest shape is:
 {
   "version": "0.1.0",
   "download_url": "https://codez.elsetech.app/downloads/CodeZ-latest.dmg",
-  "release_notes_url": "https://codez.elsetech.app/#install",
   "notes": "A new CodeZ build is available."
 }
 ```

@@ -13,7 +13,6 @@ pub const UPDATE_MANIFEST_URL: &str = "https://codez.elsetech.app/update.json";
 pub struct UpdateInfo {
     pub version: String,
     pub download_url: String,
-    pub release_notes_url: Option<String>,
     pub notes: Option<String>,
 }
 
@@ -38,7 +37,6 @@ pub fn check() -> Result<Option<UpdateInfo>, String> {
     Ok(Some(UpdateInfo {
         version,
         download_url: json_string(&body, "download_url").unwrap_or_else(|| WEBSITE_URL.to_owned()),
-        release_notes_url: json_string(&body, "release_notes_url"),
         notes: json_string(&body, "notes"),
     }))
 }

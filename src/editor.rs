@@ -1593,6 +1593,20 @@ impl Editor {
                 }
             }
         });
+        if (p.pressed || p.down) && hit.is_none() {
+            if let Some(pos) = p.pos {
+                if scroll_out.inner_rect.contains(pos) && total > 0 {
+                    let y = pos.y - scroll_out.inner_rect.top() + scroll_out.state.offset.y;
+                    let line_idx = ((y / row_step).floor() as usize).min(total - 1);
+                    let line_start = self.rope.line_to_char(line_idx);
+                    let llen = self.line_len_chars(line_idx);
+                    let col = ((pos.x - scroll_out.inner_rect.left() - gutter_w) / char_w)
+                        .round()
+                        .max(0.0) as usize;
+                    hit = Some(line_start + col.min(llen));
+                }
+            }
+        }
 
         // Show the text (I-beam) cursor over the editing area, not the arrow.
         if ui.rect_contains_pointer(scroll_out.inner_rect) {
