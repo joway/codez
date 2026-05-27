@@ -15,7 +15,7 @@
     <header class="site-header">
       <a class="brand" href="#top" aria-label="CodeZ home">
         <img src="assets/logo-512.png" alt="" width="32" height="32">
-        <span>CodeZ</span>
+        <span>Code<span class="brand-z">Z</span></span>
       </a>
       <nav aria-label="Primary navigation">
         <a href="#workspace">Workspace</a>
@@ -76,9 +76,9 @@
                 <span class="tab">shell 2</span>
               </div>
               <div class="terminal-grid">
-                <p><span class="prompt">$</span> cargo build</p>
-                <p class="ok">Finished dev profile in 1.67s</p>
-                <p><span class="prompt">$</span> git diff src/app.rs</p>
+                <p><span class="prompt">$</span> codez ~/Projects/app</p>
+                <p class="ok">Opened workspace in CodeZ</p>
+                <p><span class="prompt">$</span> codex resume a81f2c</p>
                 <pre><span class="add">+ reset.format("%H:%M").to_string()</span>
 <span class="del">- label.clone()</span>
 <span class="add">+ format_local_reset_time(reset)</span></pre>
@@ -188,24 +188,24 @@
       <section id="features" class="features">
         <div class="feature-copy">
           <span>Built for daily use</span>
-          <h2>Fast native UI, practical defaults, no web shell around your editor.</h2>
+          <h2>Everything you need to move through a codebase quickly.</h2>
         </div>
         <div class="feature-list">
           <div>
-            <h3>Native rendering</h3>
-            <p>egui and wgpu render through Metal on macOS with a compact, Zed-style interface.</p>
+            <h3>Open a project and get oriented</h3>
+            <p>Browse files, jump to what you need, and keep the current folder, file, and changes in view.</p>
           </div>
           <div>
-            <h3>Real terminal panes</h3>
-            <p>PTY-backed terminals support selection, paste, URLs, IME input, and login-shell PATH behavior.</p>
+            <h3>Work with agents without losing context</h3>
+            <p>Resume Codex or Claude Code sessions beside your code instead of switching between separate windows.</p>
           </div>
           <div>
-            <h3>Git-first workflow</h3>
-            <p>Local operations use libgit2 while push shells out to system git so your existing credentials keep working.</p>
+            <h3>Review changes before you ship</h3>
+            <p>See what changed, stage the right files, write a commit message, and push when it is ready.</p>
           </div>
           <div>
-            <h3>Graceful agents</h3>
-            <p>The app works whether Codex, Claude Code, both, or neither are installed.</p>
+            <h3>Use it your way</h3>
+            <p>CodeZ stays useful as an editor, a diff viewer, an agent workspace, or all three together.</p>
           </div>
         </div>
       </section>
@@ -213,14 +213,16 @@
       <section id="install" class="install">
         <div>
           <span>Install</span>
-          <h2>Download or build locally.</h2>
-          <p>CodeZ is macOS-focused. The app checks this website for new releases.</p>
+          <h2>Download CodeZ for macOS.</h2>
+          <p>Install the latest signed DMG. CodeZ checks this website for future updates.</p>
         </div>
-        <div class="command-card" aria-label="Build commands">
-          <code>downloads/CodeZ-latest.dmg</code>
-          <code>cargo run</code>
-          <code>cargo run -- /path/to/project</code>
-          <code>./scripts/package-macos.sh</code>
+        <div class="download-card" aria-label="Download CodeZ">
+          <img src="assets/logo-512.png" alt="" width="54" height="54">
+          <div>
+            <h3>CodeZ latest</h3>
+            <p>macOS 11 or later</p>
+          </div>
+          <a class="primary-action" href="downloads/CodeZ-latest.dmg">Download DMG</a>
         </div>
       </section>
     </main>

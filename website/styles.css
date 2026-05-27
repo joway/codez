@@ -61,6 +61,10 @@ a {
   border-radius: 8px;
 }
 
+.brand-z {
+  color: var(--muted);
+}
+
 nav {
   display: flex;
   align-items: center;
@@ -481,20 +485,28 @@ h3 {
   align-items: center;
 }
 
-.command-card {
+.download-card {
   display: grid;
-  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
   padding: 18px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--inset);
 }
 
-code {
-  display: block;
-  overflow-wrap: anywhere;
-  color: var(--dim);
-  font: 14px/1.4 "SF Mono", Menlo, Consolas, monospace;
+.download-card img {
+  border-radius: 12px;
+}
+
+.download-card h3,
+.download-card p {
+  margin: 0;
+}
+
+.download-card p {
+  color: var(--muted);
 }
 
 footer {
@@ -589,6 +601,15 @@ footer a:hover {
   .mode-grid,
   .feature-list {
     grid-template-columns: 1fr;
+  }
+
+  .download-card {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .download-card .primary-action {
+    grid-column: 1 / -1;
+    width: 100%;
   }
 
   footer {
