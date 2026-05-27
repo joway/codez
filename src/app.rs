@@ -62,6 +62,9 @@ pub struct CodezApp {
     menus: Menus,
     settings: Settings,
     title_dirty: bool,
+    show_shortcuts: bool,
+    /// Startup prompt offering to install the `codez` CLI.
+    show_cli_prompt: bool,
 
     // --- File-tree operations ---
     file_clipboard: Option<PathBuf>,
@@ -76,13 +79,27 @@ pub struct CodezApp {
 
     // --- Agent mode ---
     sessions: Vec<agent::AgentSession>,
-    /// Selected session tracked by id (indices shift as the list is rescanned).
-    selected_session: Option<String>,
-    terminal: Option<Terminal>,
+    /// Open terminal tabs and the active one.
+    terminals: Vec<TermTab>,
+    active_term: Option<usize>,
+    /// Monotonic counter for naming blank terminals ("shell 1", "shell 2", …).
+    term_seq: u32,
     agent_status: String,
     agent_scan_at: std::time::Instant,
+    /// Codex / Claude usage readouts, refreshed in the background.
+    usage: crate::usage::Usage,
+    usage_rx: Option<std::sync::mpsc::Receiver<crate::usage::Usage>>,
+    usage_at: Option<std::time::Instant>,
     /// Last time the Diff page re-probed a non-git folder for a new repo.
     git_recheck_at: std::time::Instant,
+}
+
+/// One terminal tab in Agent mode.
+struct TermTab {
+    title: String,
+    /// The resumed session's id, if this tab was opened from the session list.
+    session_id: Option<String>,
+    terminal: Terminal,
 }
 
 /// A pending file-tree text prompt (modal naming dialog).
@@ -128,8 +145,11 @@ impl CodezApp {
             push_rx: None,
             push_status: String::new(),
             menus: Menus::install(),
-            settings: Settings::default(),
+            settings: Settings::load(),
             title_dirty: false,
+            show_shortcuts: false,
+            // Offer to install the CLI on first launches, until installed or dismissed.
+            show_cli_prompt: !crate::cli::installed() && !crate::cli::prompt_dismissed(),
             file_clipboard: None,
             prompt: None,
             prompt_text: String::new(),
@@ -137,8 +157,12 @@ impl CodezApp {
             project_search: crate::search::ProjectSearch::default(),
             palette: crate::palette::Palette::default(),
             sessions: Vec::new(),
-            selected_session: None,
-            terminal: None,
+            terminals: Vec::new(),
+            active_term: None,
+            term_seq: 0,
+            usage: crate::usage::Usage::default(),
+            usage_rx: None,
+            usage_at: None,
             agent_status: String::new(),
             agent_scan_at: std::time::Instant::now(),
             git_recheck_at: std::time::Instant::now(),
@@ -195,6 +219,8 @@ impl eframe::App for CodezApp {
         }
         self.settings.ui(ctx);
         self.file_prompt_ui(ctx);
+        self.shortcuts_ui(ctx);
+        self.cli_prompt_ui(ctx);
 
         // Native menu clicks don't wake the window, so poll a few times a second.
         ctx.request_repaint_after(std::time::Duration::from_millis(150));
@@ -211,15 +237,124 @@ impl CodezApp {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(PANEL_LEFT_PAD);
                     ui.label(RichText::new("CodeZ").color(theme::TEXT_DIM).strong());
+                    ui.add_space(7.0);
+                    if help_icon(ui) {
+                        self.show_shortcuts = true;
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(4.0);
-                        // Right-to-left add order yields a left-to-right visual
-                        // order of Agent / Editor / Diff.
-                        ui.selectable_value(&mut self.mode, Mode::GitDiff, "  Diff  ");
-                        ui.selectable_value(&mut self.mode, Mode::FileBrowser, "  Editor  ");
-                        ui.selectable_value(&mut self.mode, Mode::Agent, "  Agent  ");
+                        if let Some(mode) = mode_switch(ui, self.mode) {
+                            self.mode = mode;
+                        }
                     });
                 });
+            });
+    }
+
+    /// Modal listing every keyboard shortcut, opened by the `?` in the top bar.
+    fn shortcuts_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcuts {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Keyboard Shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(540.0)
+                    .show(ui, |ui| {
+                        shortcut_group(
+                            ui,
+                            "General",
+                            &[
+                                ("⌘1", "Agent"),
+                                ("⌘2", "Editor"),
+                                ("⌘3", "Diff"),
+                                ("⌘O", "Open folder"),
+                                ("⌘S", "Save file"),
+                                ("⌘,", "Settings"),
+                                ("⌘P", "Quick-open file"),
+                                ("⌘⇧P", "Command palette"),
+                                ("⌘⇧F", "Find in files"),
+                            ],
+                        );
+                        shortcut_group(
+                            ui,
+                            "Editor",
+                            &[
+                                ("⌘Z  /  ⌘⇧Z", "Undo / Redo"),
+                                ("⌘X  ⌘C  ⌘V", "Cut / Copy / Paste"),
+                                ("⌘A", "Select all"),
+                                ("⌘F  /  ⌘⌥F", "Find / Find & replace"),
+                                ("⌘G  /  ⌘⇧G", "Next / Previous match"),
+                                ("⌘D", "Select next occurrence"),
+                                ("⌘L  /  ⌘⇧L", "Select line / Split selection to lines"),
+                                ("⌘⇧D  /  ⌘⇧K", "Duplicate / Delete lines"),
+                                ("⌘/", "Toggle line comment"),
+                                ("Tab  /  ⇧Tab", "Indent / Unindent"),
+                                ("⌘↵  /  ⌘⇧↵", "Insert line below / above"),
+                                ("⌘←  /  ⌘→", "Line start / end"),
+                                ("⌥←  /  ⌥→", "Word left / right"),
+                                ("⌘⌫", "Delete to line start"),
+                                ("Esc", "Collapse selections / cursors"),
+                            ],
+                        );
+                        shortcut_group(
+                            ui,
+                            "Agent terminal",
+                            &[
+                                ("⌘C", "Copy selection"),
+                                ("⌘V", "Paste"),
+                                ("⌘+Click", "Open link under cursor"),
+                                ("Drag", "Select text"),
+                                ("Double / Triple-click", "Select word / line"),
+                            ],
+                        );
+                        ui.add_space(8.0);
+                    });
+            });
+        if !open {
+            self.show_shortcuts = false;
+        }
+    }
+
+    /// Startup prompt: offer to install the `codez` shell command, with
+    /// Install / Not now / Don't remind me again.
+    fn cli_prompt_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_cli_prompt {
+            return;
+        }
+        egui::Window::new("Install codez command")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label("Open folders from the terminal with the codez command.");
+                ui.label(
+                    RichText::new("e.g.   codez .    or    codez <path>")
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if theme::pill_button(ui, "Install") {
+                        let _ = crate::cli::install();
+                        self.show_cli_prompt = false;
+                    }
+                    ui.add_space(8.0);
+                    if theme::pill_button(ui, "Not now") {
+                        self.show_cli_prompt = false;
+                    }
+                    ui.add_space(8.0);
+                    if theme::pill_button(ui, "Don't remind me again") {
+                        crate::cli::dismiss_prompt();
+                        self.show_cli_prompt = false;
+                    }
+                });
+                ui.add_space(4.0);
             });
     }
 
@@ -274,9 +409,9 @@ impl CodezApp {
         self.selected_change = None;
         self.diff_lines.clear();
 
-        // Drop any running terminal (sends shutdown) and rescan agent sessions.
-        self.terminal = None;
-        self.selected_session = None;
+        // Drop any running terminals (sends shutdown) and rescan agent sessions.
+        self.terminals.clear();
+        self.active_term = None;
         self.agent_status.clear();
         self.sessions = agent::scan(dir);
 
@@ -337,12 +472,23 @@ impl CodezApp {
                 self.agent_scan_at = std::time::Instant::now();
             }
         }
+        self.poll_usage(ctx);
+        let usage = self.usage.clone();
 
         egui::SidePanel::left("agent_sessions")
             .resizable(true)
             .default_width(300.0)
             .frame(egui::Frame::none().fill(theme::SIDEBAR))
             .show(ctx, |ui| {
+                // Usage readouts pinned to the bottom; declared first so the
+                // list above fills the remaining height. Shown only when at
+                // least one agent (codex / claude) is present on this machine.
+                if usage.codex.is_some() || usage.claude.is_some() {
+                    egui::TopBottomPanel::bottom("agent_usage")
+                        .frame(egui::Frame::none().fill(theme::SIDEBAR))
+                        .show_inside(ui, |ui| usage_panel(ui, &usage));
+                }
+
                 section_header(ui, "AGENT SESSIONS");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -358,19 +504,23 @@ impl CodezApp {
                         )
                         .clicked()
                     {
-                        self.selected_session = None;
-                        self.start_terminal(ui.ctx(), None);
+                        self.open_blank_terminal(ui.ctx());
                     }
                 });
                 ui.add_space(8.0);
 
+                // A session row is highlighted when the active tab is resuming it.
+                let active_sid = self
+                    .active_term
+                    .and_then(|i| self.terminals.get(i))
+                    .and_then(|t| t.session_id.clone());
                 let font_size = self.settings.ui_font_size();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let mut select = None;
                         for s in self.sessions.iter() {
-                            let selected = self.selected_session.as_deref() == Some(s.id.as_str());
+                            let selected = active_sid.as_deref() == Some(s.id.as_str());
                             if session_row(ui, s, selected, font_size).clicked() {
                                 select = Some(s.id.clone());
                             }
@@ -391,41 +541,122 @@ impl CodezApp {
                     diff_empty_state(ui, "Open a folder to use agents");
                     return;
                 }
-                match &mut self.terminal {
-                    Some(term) => {
-                        agent_terminal_header(ui, term.exited(), &self.agent_status);
-                        term.ui(ui);
+                if self.terminals.is_empty() {
+                    diff_empty_state(ui, "Select a session to resume, or open a new terminal");
+                    return;
+                }
+
+                let font_size = ui_font_size(ui);
+                let action = terminal_tab_bar(ui, &self.terminals, self.active_term, font_size);
+                match action {
+                    TabAction::Switch(i) => {
+                        self.active_term = Some(i);
+                        if let Some(t) = self.terminals.get_mut(i) {
+                            t.terminal.request_focus();
+                        }
                     }
-                    None => diff_empty_state(
-                        ui,
-                        "Select a session to resume, or open a new terminal",
-                    ),
+                    TabAction::Close(i) => self.close_terminal(i),
+                    TabAction::None => {}
+                }
+
+                if let Some(tab) = self.active_term.and_then(|i| self.terminals.get_mut(i)) {
+                    tab.terminal.ui(ui);
                 }
             });
     }
 
+    /// Open a session from the list in a tab — reusing an existing tab for the
+    /// same session, or spawning a new one that runs its resume command.
     fn open_session(&mut self, ctx: &egui::Context, id: &str) {
+        if let Some(i) = self
+            .terminals
+            .iter()
+            .position(|t| t.session_id.as_deref() == Some(id))
+        {
+            self.active_term = Some(i);
+            self.terminals[i].terminal.request_focus();
+            return;
+        }
         let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
+        let short: String = id.chars().take(6).collect();
+        let title = format!("{} {short}", session.kind.label());
         let command = session.resume_command();
-        self.selected_session = Some(id.to_string());
-        self.start_terminal(ctx, Some(command));
+        self.open_terminal(ctx, title, Some(id.to_string()), Some(command));
     }
 
-    /// (Re)spawn the terminal in the open folder, optionally typing an initial
-    /// command line into the freshly launched login shell.
-    fn start_terminal(&mut self, ctx: &egui::Context, command: Option<String>) {
+    /// Open a blank login-shell terminal tab (the user runs whatever they want).
+    fn open_blank_terminal(&mut self, ctx: &egui::Context) {
+        self.term_seq += 1;
+        let title = format!("shell {}", self.term_seq);
+        self.open_terminal(ctx, title, None, None);
+    }
+
+    /// Spawn a terminal in the open folder and add it as a new active tab.
+    fn open_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        title: String,
+        session_id: Option<String>,
+        command: Option<String>,
+    ) {
         let Some(root) = self.root.clone() else {
             return;
         };
-        self.terminal = None; // drop the previous child first
         match Terminal::spawn(ctx, root, command) {
-            Ok(term) => {
-                self.terminal = Some(term);
+            Ok(terminal) => {
+                self.terminals.push(TermTab {
+                    title,
+                    session_id,
+                    terminal,
+                });
+                self.active_term = Some(self.terminals.len() - 1);
                 self.agent_status.clear();
             }
             Err(e) => self.agent_status = format!("terminal error: {e}"),
+        }
+    }
+
+    /// Collect a finished usage fetch and kick off a new one every 60s.
+    fn poll_usage(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.usage_rx {
+            if let Ok(usage) = rx.try_recv() {
+                self.usage = usage;
+                self.usage_rx = None;
+                self.usage_at = Some(std::time::Instant::now());
+            }
+        }
+        let due = self
+            .usage_at
+            .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(60));
+        if due && self.usage_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::usage::fetch());
+                ctx.request_repaint();
+            });
+            self.usage_rx = Some(rx);
+            self.usage_at = Some(std::time::Instant::now()); // don't respawn each frame
+        }
+    }
+
+    /// Close tab `i`, dropping its child process, and keep `active_term` valid.
+    fn close_terminal(&mut self, i: usize) {
+        if i >= self.terminals.len() {
+            return;
+        }
+        self.terminals.remove(i); // drops the Terminal → sends shutdown
+        self.active_term = if self.terminals.is_empty() {
+            None
+        } else {
+            let prev = self.active_term.unwrap_or(0);
+            let next = if prev > i { prev - 1 } else { prev };
+            Some(next.min(self.terminals.len() - 1))
+        };
+        if let Some(t) = self.active_term.and_then(|a| self.terminals.get_mut(a)) {
+            t.terminal.request_focus();
         }
     }
 
@@ -472,7 +703,8 @@ impl CodezApp {
                 .as_ref()
                 .map(|e| e.status())
                 .unwrap_or_else(|| self.file_status.clone());
-            file_header(ui, &path, &status);
+            let dirty = self.editor.as_ref().is_some_and(Editor::is_dirty);
+            file_header(ui, &path, &status, dirty);
 
             // Banner shown when the file changed on disk while you have edits.
             if self.external_changed {
@@ -482,10 +714,11 @@ impl CodezApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("⚠ File changed on disk").color(theme::YELLOW));
-                            if ui.button("Reload").clicked() {
+                            if theme::pill_button(ui, "Reload") {
                                 self.load_file(&path);
                             }
-                            if ui.button("Keep mine").clicked() {
+                            ui.add_space(8.0);
+                            if theme::pill_button(ui, "Keep mine") {
                                 self.external_changed = false;
                             }
                         });
@@ -633,9 +866,11 @@ impl CodezApp {
                 if !self.prompt_error.is_empty() {
                     ui.colored_label(theme::RED, &self.prompt_error);
                 }
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    submit |= ui.button("OK").clicked();
-                    cancel |= ui.button("Cancel").clicked();
+                    submit |= theme::pill_button(ui, "OK");
+                    ui.add_space(8.0);
+                    cancel |= theme::pill_button(ui, "Cancel");
                 });
                 submit |= ui.input(|i| i.key_pressed(egui::Key::Enter));
                 cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
@@ -806,10 +1041,13 @@ impl CodezApp {
 
                 match self.diff_tab {
                     DiffSidebarTab::Changed => {
+                        // Commit box pinned to the bottom; the list fills the
+                        // remaining space above it.
+                        egui::TopBottomPanel::bottom("commit_panel")
+                            .frame(egui::Frame::none().fill(theme::SIDEBAR))
+                            .show_inside(ui, |ui| commit_panel(ui, self));
                         diff_list_label(ui, "LOCAL CHANGES");
-                        let list_height = (ui.available_height() - 156.0).max(80.0);
                         egui::ScrollArea::vertical()
-                            .max_height(list_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 let mut select = None;
@@ -844,7 +1082,6 @@ impl CodezApp {
                                     }
                                 }
                             });
-                        commit_panel(ui, self);
                     }
                     DiffSidebarTab::Commits => {
                         diff_list_label(ui, "COMMITS");
@@ -1070,8 +1307,8 @@ fn push_toolbar(ui: &mut egui::Ui, branch: Option<&str>, pushing: bool, status: 
         ui.add_space(14.0);
         let label = match branch {
             Some(b) if pushing => format!("Pushing origin/{b}…"),
-            Some(b) => format!("⬆ Push  origin/{b}"),
-            None => "⬆ Push".to_string(),
+            Some(b) => format!("↑ Push  origin/{b}"),
+            None => "↑ Push".to_string(),
         };
         let enabled = branch.is_some() && !pushing;
         let width = (ui.available_width() - 28.0).max(80.0);
@@ -1103,6 +1340,103 @@ fn push_toolbar(ui: &mut egui::Ui, branch: Option<&str>, pushing: bool, status: 
         });
     }
     ui.add_space(8.0);
+    clicked
+}
+
+/// A circled "?" help icon. Returns true when clicked.
+fn help_icon(ui: &mut egui::Ui) -> bool {
+    let d = 12.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Keyboard shortcuts");
+    let color = if resp.hovered() {
+        theme::TEXT
+    } else {
+        theme::TEXT_DIM
+    };
+    let center = rect.center();
+    ui.painter()
+        .circle_stroke(center, d * 0.5 - 1.5, Stroke::new(1.3, color));
+    ui.painter().text(
+        center,
+        Align2::CENTER_CENTER,
+        "?",
+        FontId::proportional(d * 0.64),
+        color,
+    );
+    resp.clicked()
+}
+
+/// One titled block of `(keys, description)` rows in the shortcuts modal.
+fn shortcut_group(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
+    let fs = ui_font_size(ui);
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(title)
+            .strong()
+            .color(theme::ACCENT)
+            .size(fs * 0.82),
+    );
+    ui.add_space(4.0);
+    egui::Grid::new(("shortcuts", title))
+        .num_columns(2)
+        .spacing([24.0, 6.0])
+        .show(ui, |ui| {
+            for (keys, desc) in rows {
+                ui.label(RichText::new(*keys).monospace().color(theme::TEXT));
+                ui.label(RichText::new(*desc).color(theme::TEXT_DIM));
+                ui.end_row();
+            }
+        });
+}
+
+/// The top-right Editor / Diff / Agent switch, drawn as a rounded segmented
+/// control (like the Changed/Commits tabs) rather than separate buttons.
+/// Returns the newly chosen mode when a segment is clicked.
+fn mode_switch(ui: &mut egui::Ui, current: Mode) -> Option<Mode> {
+    let segments = [
+        (Mode::Agent, "Agent"),
+        (Mode::FileBrowser, "Editor"),
+        (Mode::GitDiff, "Diff"),
+    ];
+    let font = FontId::proportional(ui_font_size(ui) * 0.82);
+    let seg_w = 60.0;
+    let height = 24.0;
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(seg_w * segments.len() as f32, height),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 6.0, theme::INSET);
+    ui.painter()
+        .rect_stroke(rect, 6.0, Stroke::new(1.0, theme::BORDER));
+
+    let mut clicked = None;
+    for (i, (mode, label)) in segments.iter().enumerate() {
+        let seg = Rect::from_min_size(
+            Pos2::new(rect.left() + seg_w * i as f32, rect.top()),
+            Vec2::new(seg_w, height),
+        );
+        let resp = ui.interact(seg, ui.id().with(("mode_seg", i)), Sense::click());
+        let active = current == *mode;
+        if active {
+            ui.painter()
+                .rect_filled(seg.shrink(3.0), 5.0, theme::SIDEBAR_SELECTED);
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_filled(seg.shrink(3.0), 5.0, theme::SIDEBAR_HOVER);
+        }
+        ui.painter().text(
+            seg.center(),
+            Align2::CENTER_CENTER,
+            *label,
+            font.clone(),
+            if active { theme::TEXT } else { theme::TEXT_DIM },
+        );
+        if resp.clicked() {
+            clicked = Some(*mode);
+        }
+    }
     clicked
 }
 
@@ -1376,12 +1710,22 @@ fn commit_panel(ui: &mut egui::Ui, app: &mut CodezApp) {
     ui.horizontal(|ui| {
         ui.add_space(12.0);
         let width = (ui.available_width() - 24.0).max(80.0);
-        ui.add_sized(
-            Vec2::new(width, 30.0),
-            egui::TextEdit::singleline(&mut app.commit_summary)
-                .hint_text(RichText::new("Summary").color(theme::TEXT_MUTED))
-                .desired_width(width),
-        );
+        // Fixed-height box: a multiline message can be any length, but it must
+        // scroll inside this 72px frame rather than growing the panel and
+        // pushing the Commit button off-screen.
+        egui::ScrollArea::vertical()
+            .id_salt("commit_message")
+            .max_height(72.0)
+            .max_width(width)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut app.commit_summary)
+                        .hint_text(RichText::new("Message").color(theme::TEXT_MUTED))
+                        .desired_width(width)
+                        .desired_rows(3),
+                );
+            });
     });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1414,6 +1758,8 @@ fn commit_panel(ui: &mut egui::Ui, app: &mut CodezApp) {
             );
         });
     }
+    // Breathing room below the button so it doesn't sit flush against the edge.
+    ui.add_space(14.0);
 }
 
 fn commit_row(
@@ -1531,30 +1877,237 @@ fn agent_kind_color(kind: agent::AgentKind) -> Color32 {
     }
 }
 
-/// Thin strip above the terminal: the resumed session id / running state.
-fn agent_terminal_header(ui: &mut egui::Ui, exited: bool, status: &str) {
-    let rect = ui.available_rect_before_wrap();
-    let height = 26.0;
-    let (header, _) = ui.allocate_exact_size(Vec2::new(rect.width(), height), Sense::hover());
-    ui.painter().rect_filled(header, 0.0, theme::SURFACE);
+/// Bottom-of-sidebar usage readout: a session/week bar pair per agent.
+fn usage_panel(ui: &mut egui::Ui, usage: &crate::usage::Usage) {
+    let fs = ui_font_size(ui);
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("USAGE")
+                .color(theme::TEXT_MUTED)
+                .size(fs * 0.72)
+                .strong(),
+        );
+    });
+    ui.add_space(4.0);
+    // Only agents that are actually present (data available) are shown.
+    if let Some(l) = &usage.codex {
+        usage_agent_row(ui, "codex", theme::GREEN, l, fs);
+    }
+    if let Some(l) = &usage.claude {
+        usage_agent_row(ui, "claude", theme::ACCENT, l, fs);
+    }
+    ui.add_space(8.0);
+}
+
+fn usage_agent_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    color: Color32,
+    l: &crate::usage::Limits,
+    fs: f32,
+) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(RichText::new(name).color(color).size(fs * 0.78).strong());
+    });
+    usage_bar(ui, "session", l.session, fs);
+    if let Some(reset) = &l.session_reset {
+        usage_reset_time(ui, reset, fs);
+    }
+    usage_bar(ui, "week", l.week, fs);
+}
+
+fn usage_reset_time(ui: &mut egui::Ui, reset: &crate::usage::ResetTime, fs: f32) {
+    ui.horizontal(|ui| {
+        ui.add_space(18.0);
+        ui.add_sized(Vec2::new(46.0, fs * 0.85), egui::Label::new(""));
+        ui.label(
+            RichText::new(format!("resets {}", format_reset_time(reset)))
+                .color(theme::TEXT_MUTED)
+                .size(fs * 0.66),
+        );
+    });
+}
+
+fn format_reset_time(reset: &crate::usage::ResetTime) -> String {
+    use chrono::{Local, TimeZone};
+
+    match reset {
+        crate::usage::ResetTime::Label(label) => chrono::DateTime::parse_from_rfc3339(label)
+            .map(|dt| format_local_reset_time(dt.with_timezone(&Local)))
+            .unwrap_or_else(|_| label.clone()),
+        crate::usage::ResetTime::EpochSeconds(reset_at) => {
+            let Some(reset) = Local.timestamp_opt(*reset_at as i64, 0).single() else {
+                return "--".to_owned();
+            };
+            format_local_reset_time(reset)
+        }
+    }
+}
+
+fn format_local_reset_time(reset: chrono::DateTime<chrono::Local>) -> String {
+    let now: chrono::DateTime<chrono::Local> = chrono::Local::now();
+    if reset.date_naive() == now.date_naive() {
+        reset.format("%H:%M").to_string()
+    } else {
+        reset.format("%b %-d %H:%M").to_string()
+    }
+}
+
+fn usage_bar(ui: &mut egui::Ui, label: &str, pct: f32, fs: f32) {
+    ui.horizontal(|ui| {
+        ui.add_space(18.0);
+        ui.add_sized(
+            Vec2::new(46.0, fs),
+            egui::Label::new(RichText::new(label).color(theme::TEXT_DIM).size(fs * 0.7)),
+        );
+        // Reserve room on the right for the percentage text.
+        let bar_w = (ui.available_width() - 40.0).max(30.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(bar_w, 6.0), Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, theme::INSET);
+        let frac = (pct / 100.0).clamp(0.0, 1.0);
+        let color = if pct >= 90.0 {
+            theme::RED
+        } else if pct >= 70.0 {
+            theme::YELLOW
+        } else {
+            theme::GREEN
+        };
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, Vec2::new(rect.width() * frac, rect.height())),
+            3.0,
+            color,
+        );
+        ui.label(
+            RichText::new(format!("{pct:.0}%"))
+                .color(theme::TEXT_DIM)
+                .size(fs * 0.7),
+        );
+    });
+}
+
+/// What the user did on the terminal tab strip this frame.
+enum TabAction {
+    None,
+    Switch(usize),
+    Close(usize),
+}
+
+/// iTerm2-style tab strip above the active terminal. The active tab is filled
+/// with the terminal background so it merges with the content below, marked by
+/// a thin accent bar on top; inactive tabs sit on a darker strip with hairline
+/// separators. Each tab has a close × that lights up on hover. (New terminals
+/// are opened from the sidebar button, so there is no + here.)
+fn terminal_tab_bar(
+    ui: &mut egui::Ui,
+    tabs: &[TermTab],
+    active: Option<usize>,
+    font_size: f32,
+) -> TabAction {
+    let mut action = TabAction::None;
+    let strip_h = 32.0;
+    let full = ui.available_rect_before_wrap();
+    let (strip, _) = ui.allocate_exact_size(Vec2::new(full.width(), strip_h), Sense::hover());
+
+    ui.painter().rect_filled(strip, 0.0, theme::SURFACE);
     ui.painter().line_segment(
-        [header.left_bottom(), header.right_bottom()],
+        [strip.left_bottom(), strip.right_bottom()],
         Stroke::new(1.0, theme::BORDER),
     );
-    let label = if !status.is_empty() {
-        status.to_string()
-    } else if exited {
-        "session ended".to_string()
-    } else {
-        "running".to_string()
-    };
-    ui.painter().text(
-        Pos2::new(header.left() + 14.0, header.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(ui_font_size(ui) * 0.78),
-        if exited { theme::TEXT_MUTED } else { theme::GREEN },
-    );
+
+    let n = tabs.len().max(1);
+    // Shrink to fit so tabs never overflow the strip; cap the width like iTerm2.
+    let tab_w = (strip.width() / n as f32).min(220.0);
+    let title_font = FontId::proportional(font_size * 0.82);
+
+    for (i, tab) in tabs.iter().enumerate() {
+        let x0 = strip.left() + tab_w * i as f32;
+        let tab_rect = Rect::from_min_size(Pos2::new(x0, strip.top()), Vec2::new(tab_w, strip_h));
+        let is_active = active == Some(i);
+
+        let tab_resp = ui.interact(tab_rect, ui.id().with(("term_tab", i)), Sense::click());
+        let close_rect = Rect::from_center_size(
+            Pos2::new(tab_rect.right() - 13.0, tab_rect.center().y),
+            Vec2::splat(16.0),
+        );
+        let close_resp = ui.interact(close_rect, ui.id().with(("term_close", i)), Sense::click());
+
+        let fill = if is_active {
+            theme::INSET
+        } else if tab_resp.hovered() {
+            theme::SIDEBAR_HOVER
+        } else {
+            theme::SURFACE
+        };
+        let fg = if tab.terminal.exited() {
+            theme::TEXT_MUTED
+        } else if is_active {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM
+        };
+
+        let painter = ui.painter();
+        painter.rect_filled(tab_rect, 0.0, fill);
+        if is_active {
+            // Accent bar on top, and hide the strip's bottom border under the
+            // active tab so it visually connects to the terminal below.
+            painter.rect_filled(
+                Rect::from_min_size(tab_rect.left_top(), Vec2::new(tab_w, 2.0)),
+                0.0,
+                theme::ACCENT,
+            );
+            painter.line_segment(
+                [tab_rect.left_bottom(), tab_rect.right_bottom()],
+                Stroke::new(1.0, theme::INSET),
+            );
+        }
+        // Hairline separator on the right edge (skip after the active tab).
+        if !is_active {
+            painter.line_segment(
+                [
+                    Pos2::new(tab_rect.right(), tab_rect.top() + 6.0),
+                    Pos2::new(tab_rect.right(), tab_rect.bottom() - 6.0),
+                ],
+                Stroke::new(1.0, theme::BORDER),
+            );
+        }
+
+        let text_left = tab_rect.left() + 12.0;
+        let text_max = (close_rect.left() - text_left - 4.0).max(10.0);
+        let title = ellipsize(ui, &tab.title, title_font.clone(), text_max);
+        ui.painter().text(
+            Pos2::new(text_left, tab_rect.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            title_font.clone(),
+            fg,
+        );
+
+        if close_resp.hovered() {
+            ui.painter().rect_filled(close_rect, 3.0, theme::RAISED);
+        }
+        ui.painter().text(
+            close_rect.center(),
+            Align2::CENTER_CENTER,
+            "×",
+            FontId::proportional(font_size * 0.95),
+            if close_resp.hovered() { theme::TEXT } else { fg },
+        );
+
+        if close_resp.clicked() {
+            action = TabAction::Close(i);
+        } else if tab_resp.clicked() {
+            action = TabAction::Switch(i);
+        }
+    }
+
+    action
 }
 
 fn row_bg(selected: bool, hovered: bool) -> Option<Color32> {
@@ -1630,24 +2183,38 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
 }
 
 /// A breadcrumb-style header for the content pane: path + optional status.
-fn file_header(ui: &mut egui::Ui, path: &Path, status: &str) {
+fn file_header(ui: &mut egui::Ui, path: &Path, status: &str, dirty: bool) {
     let font_size = ui_font_size(ui);
     ui.add_space(4.0);
     ui.horizontal(|ui| {
+        // VS Code-style unsaved dot before the filename.
+        if dirty {
+            ui.label(RichText::new("●").color(theme::YELLOW).size(font_size * 0.7))
+                .on_hover_text("Unsaved changes");
+        }
         ui.label(
             RichText::new(path.to_string_lossy())
                 .monospace()
                 .color(theme::TEXT),
         );
-        if !status.is_empty() {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // Explicit "Unsaved" badge on the right, plus the line/char stats.
+            if dirty {
+                ui.label(
+                    RichText::new("● Unsaved")
+                        .color(theme::YELLOW)
+                        .size(font_size * 0.85)
+                        .strong(),
+                );
+            }
+            if !status.is_empty() {
                 ui.label(
                     RichText::new(status)
                         .color(theme::TEXT_DIM)
                         .size(font_size * 0.85),
                 );
-            });
-        }
+            }
+        });
     });
     ui.separator();
 }

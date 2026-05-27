@@ -3,9 +3,10 @@
 
 use std::path::PathBuf;
 
-use egui::{Align2, Key, RichText, ScrollArea, TextEdit};
+use egui::{Align2, FontId, Key, Pos2, ScrollArea, Sense, TextEdit, Vec2};
 
 use crate::search;
+use crate::theme;
 
 const MAX_RESULTS: usize = 50;
 
@@ -210,28 +211,78 @@ impl Palette {
                 if resp.changed() {
                     self.selected = 0;
                 }
-                ui.add_space(4.0);
+                ui.add_space(6.0);
 
-                ScrollArea::vertical()
-                    .max_height(360.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (idx, entry) in entries.iter().enumerate() {
-                            let selected = idx == self.selected;
-                            let text = if self.commands {
-                                RichText::new(&entry.label)
-                            } else {
-                                RichText::new(&entry.label).monospace()
-                            };
-                            let resp = ui.selectable_label(selected, text);
-                            if resp.clicked() {
-                                chosen = Some(idx);
+                let body = egui::TextStyle::Body.resolve(ui.style()).size;
+                let row_h = 32.0;
+                // Fixed-height list (VS Code-style): the box stays this tall even
+                // with few results, instead of collapsing to fit.
+                ui.allocate_ui(Vec2::new(ui.available_width(), 420.0), |ui| {
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for (idx, entry) in entries.iter().enumerate() {
+                                let selected = idx == self.selected;
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), row_h),
+                                    Sense::click(),
+                                );
+                                if selected {
+                                    ui.painter().rect_filled(rect, 5.0, theme::SIDEBAR_SELECTED);
+                                } else if resp.hovered() {
+                                    ui.painter().rect_filled(rect, 5.0, theme::SIDEBAR_HOVER);
+                                }
+                                let x = rect.left() + 10.0;
+                                let cy = rect.center().y;
+                                match &entry.action {
+                                    PaletteAction::OpenFile(_) => {
+                                        // filename in full, parent directory dimmed beside it.
+                                        let (dir, name) = split_path(&entry.label);
+                                        let galley = ui.painter().layout_no_wrap(
+                                            name,
+                                            FontId::proportional(body),
+                                            theme::TEXT,
+                                        );
+                                        let nw = galley.size().x;
+                                        ui.painter().galley(
+                                            Pos2::new(x, cy - galley.size().y / 2.0),
+                                            galley,
+                                            theme::TEXT,
+                                        );
+                                        if !dir.is_empty() {
+                                            ui.painter().text(
+                                                Pos2::new(x + nw + 8.0, cy),
+                                                Align2::LEFT_CENTER,
+                                                dir,
+                                                FontId::proportional(body * 0.82),
+                                                theme::TEXT_MUTED,
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        ui.painter().text(
+                                            Pos2::new(x, cy),
+                                            Align2::LEFT_CENTER,
+                                            &entry.label,
+                                            FontId::proportional(body),
+                                            theme::TEXT,
+                                        );
+                                    }
+                                }
+                                if resp.clicked() {
+                                    chosen = Some(idx);
+                                }
+                                if selected {
+                                    resp.scroll_to_me(None);
+                                }
                             }
-                            if selected && resp.rect.height() > 0.0 {
-                                resp.scroll_to_me(None);
+                            if entries.is_empty() {
+                                ui.add_space(10.0);
+                                ui.weak("  No matches");
                             }
-                        }
-                    });
+                        });
+                });
             });
 
         if close {
@@ -245,6 +296,14 @@ impl Palette {
             }
         }
         None
+    }
+}
+
+/// Split a relative path into `(parent_dir, file_name)` for VS Code-style rows.
+fn split_path(rel: &str) -> (String, String) {
+    match rel.rsplit_once('/') {
+        Some((dir, name)) => (dir.to_string(), name.to_string()),
+        None => (String::new(), rel.to_string()),
     }
 }
 

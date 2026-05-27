@@ -146,7 +146,6 @@ impl ProjectSearch {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("SEARCH").color(theme::TEXT_MUTED).size(11.0));
                     let resp = ui.add(
                         TextEdit::singleline(&mut self.query)
                             .hint_text("Find in files")
@@ -157,7 +156,7 @@ impl ProjectSearch {
                         self.focus = false;
                     }
                     let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Search").clicked() || submit {
+                    if theme::pill_button(ui, "Search") || submit {
                         self.start(root);
                     }
                     ui.label(
@@ -170,7 +169,7 @@ impl ProjectSearch {
                         .color(theme::TEXT_DIM),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").clicked() {
+                        if theme::icon_button(ui, "×", "Close") {
                             close = true;
                         }
                     });
@@ -181,12 +180,27 @@ impl ProjectSearch {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for file in &self.results {
-                            ui.label(
-                                RichText::new(&file.rel)
-                                    .color(theme::ACCENT)
-                                    .strong()
-                                    .monospace(),
-                            );
+                            // The filename header jumps to the file's first match.
+                            let header = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(&file.rel)
+                                            .color(theme::ACCENT)
+                                            .strong()
+                                            .monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if header.clicked() {
+                                let first = file.hits.first();
+                                clicked = Some(OpenTarget {
+                                    path: file.path.clone(),
+                                    line: first.map_or(0, |h| h.line),
+                                    col: first.map_or(0, |h| h.col),
+                                    len: query_len,
+                                });
+                            }
                             for hit in &file.hits {
                                 let label = format!("{:>5}  {}", hit.line + 1, hit.text.trim_end());
                                 if ui

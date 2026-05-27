@@ -2,6 +2,8 @@
 //!
 //! Keeps the global UI font and the editor/diff monospace font.
 
+use std::path::PathBuf;
+
 use egui::{Context, FontData, FontDefinitions, FontFamily, FontId, TextStyle};
 
 const CJK_FONTS: &[&str] = &[
@@ -32,6 +34,24 @@ impl UiFont {
             UiFont::SfPro => "SF Pro",
             UiFont::Helvetica => "Helvetica Neue",
             UiFont::NewYork => "New York",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            UiFont::BuiltIn => "builtin",
+            UiFont::SfPro => "sfpro",
+            UiFont::Helvetica => "helvetica",
+            UiFont::NewYork => "newyork",
+        }
+    }
+
+    fn from_key(s: &str) -> Self {
+        match s {
+            "builtin" => UiFont::BuiltIn,
+            "helvetica" => UiFont::Helvetica,
+            "newyork" => UiFont::NewYork,
+            _ => UiFont::SfPro,
         }
     }
 
@@ -70,6 +90,24 @@ impl MonoFont {
         }
     }
 
+    fn key(self) -> &'static str {
+        match self {
+            MonoFont::BuiltIn => "builtin",
+            MonoFont::SfMono => "sfmono",
+            MonoFont::Menlo => "menlo",
+            MonoFont::Monaco => "monaco",
+        }
+    }
+
+    fn from_key(s: &str) -> Self {
+        match s {
+            "builtin" => MonoFont::BuiltIn,
+            "menlo" => MonoFont::Menlo,
+            "monaco" => MonoFont::Monaco,
+            _ => MonoFont::SfMono,
+        }
+    }
+
     fn path(self) -> Option<&'static str> {
         match self {
             MonoFont::BuiltIn => None,
@@ -87,6 +125,7 @@ pub struct Settings {
     ui_font: UiFont,
     mono: MonoFont,
     dirty: bool,
+    cli_status: String,
 }
 
 impl Default for Settings {
@@ -98,11 +137,60 @@ impl Default for Settings {
             ui_font: UiFont::SfPro,
             mono: MonoFont::SfMono,
             dirty: true,
+            cli_status: String::new(),
         }
     }
 }
 
 impl Settings {
+    /// Load persisted settings from disk, falling back to defaults.
+    pub fn load() -> Self {
+        let mut s = Self::default();
+        if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+            for line in text.lines() {
+                let Some((key, val)) = line.split_once('=') else {
+                    continue;
+                };
+                let val = val.trim();
+                match key.trim() {
+                    "ui_font_size" => {
+                        if let Ok(n) = val.parse() {
+                            s.ui_font_size = n;
+                        }
+                    }
+                    "editor_font_size" => {
+                        if let Ok(n) = val.parse() {
+                            s.editor_font_size = n;
+                        }
+                    }
+                    "ui_font" => s.ui_font = UiFont::from_key(val),
+                    "mono" => s.mono = MonoFont::from_key(val),
+                    _ => {}
+                }
+            }
+        }
+        s.dirty = true; // re-apply fonts/sizes on the first frame
+        s
+    }
+
+    /// Persist the current settings to disk.
+    fn save(&self) {
+        let Some(path) = config_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = format!(
+            "ui_font_size={}\neditor_font_size={}\nui_font={}\nmono={}\n",
+            self.ui_font_size,
+            self.editor_font_size,
+            self.ui_font.key(),
+            self.mono.key(),
+        );
+        let _ = std::fs::write(path, body);
+    }
+
     pub fn ui_font_size(&self) -> f32 {
         self.ui_font_size
     }
@@ -181,6 +269,9 @@ impl Settings {
             FontId::monospace(self.editor_font_size),
         );
         ctx.set_style(style);
+
+        // `apply` runs whenever something changed, so persist here.
+        self.save();
     }
 
     /// Draw the settings window if open.
@@ -253,9 +344,40 @@ impl Settings {
 
                 ui.add_space(8.0);
                 ui.weak("Editor font applies to the editor and diff text.");
+
+                ui.add_space(16.0);
+                settings_section(ui, "Command line");
+                ui.weak("Run CodeZ from the terminal: 'codez .' or 'codez <path>'.");
+                ui.add_space(8.0);
+                if crate::theme::pill_button(ui, "Install 'codez' command") {
+                    self.cli_status = match crate::cli::install() {
+                        Ok(path) => format!("Installed at {path}"),
+                        Err(e) if e == "cancelled" => "Cancelled.".to_string(),
+                        Err(e) => format!("Failed: {e}"),
+                    };
+                }
+                if !self.cli_status.is_empty() {
+                    ui.add_space(6.0);
+                    ui.weak(&self.cli_status);
+                }
+
+                ui.add_space(16.0);
+                settings_section(ui, "Contact");
+                ui.weak("Questions, feedback, and bug reports.");
+                ui.add_space(8.0);
+                if crate::theme::pill_button(ui, "Contact author on X") {
+                    let _ = std::process::Command::new("open")
+                        .arg("https://x.com/jowaywang")
+                        .spawn();
+                }
             });
         self.open = open;
     }
+}
+
+fn config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".codez").join("settings.conf"))
 }
 
 fn settings_section(ui: &mut egui::Ui, title: &str) {

@@ -9,7 +9,10 @@ description = "A fast, native git diff viewer for macOS"
 eframe = { version = "0.29", default-features = false, features = ["wgpu"] }
 egui = "0.29"
 # libgit2 bindings (vendored build via cc, no system cmake needed).
-git2 = "0.19"
+# default-features off drops the ssh/https transports (and their openssl-sys
+# dependency) — we only do local repo ops; `git push` shells out to system git.
+# This also lets the app cross-compile to a universal (arm64 + x86_64) binary.
+git2 = { version = "0.19", default-features = false }
 # Native file/folder open dialogs.
 rfd = "0.15"
 # Memory-map large files instead of reading them into the heap.
@@ -25,6 +28,10 @@ muda = "0.15"
 # Headless terminal: PTY spawn + VT/ANSI parsing + grid state (no UI of its own).
 # Pinned to 0.25.x to match the API the terminal pane is written against.
 alacritty_terminal = "0.25.1"
+# Decode the embedded PNG app icon for native windows launched via `cargo run`.
+png = "0.17"
+# Format local reset times in the Agent usage panel.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Set the native window/titlebar appearance to dark.

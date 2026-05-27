@@ -15,17 +15,19 @@ use std::path::PathBuf;
 use alacritty_terminal::event::{Event, EventListener, Notify, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{self, Term, TermMode};
+use alacritty_terminal::term::{self, viewport_to_point, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 use egui::{
-    Align2, Color32, EventFilter, FontId, Key, Modifiers, Painter, Pos2, Rect, Sense, TextStyle,
-    Ui, Vec2,
+    Align2, Color32, CursorIcon, EventFilter, FontId, Key, Modifiers, Painter, Pos2, Rect, Sense,
+    Stroke, TextStyle, Ui, Vec2,
 };
 
 use crate::theme;
@@ -75,6 +77,10 @@ pub struct Terminal {
     needs_focus: bool,
     /// Sub-line trackpad scroll remainder (pixels), accumulated across frames.
     scroll_accum: f32,
+    /// Regex used to find clickable URLs in the grid.
+    url_regex: RegexSearch,
+    /// Link under the pointer this frame while ⌘ is held (for underline + open).
+    hovered_link: Option<Match>,
 }
 
 impl Terminal {
@@ -154,6 +160,11 @@ impl Terminal {
             cell: Vec2::new(cell_w as f32, cell_h as f32),
             needs_focus: true,
             scroll_accum: 0.0,
+            url_regex: RegexSearch::new(
+                r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#,
+            )
+            .expect("valid url regex"),
+            hovered_link: None,
         })
     }
 
@@ -162,13 +173,19 @@ impl Terminal {
         self.exited.load(Ordering::Relaxed)
     }
 
+    /// Grab keyboard focus on the next frame (e.g. when its tab is activated).
+    pub fn request_focus(&mut self) {
+        self.needs_focus = true;
+    }
+
     /// Render the terminal into the remaining space of `ui` and, while focused,
     /// forward keyboard input to the PTY.
     pub fn ui(&mut self, ui: &mut Ui) {
         let font = FontId::monospace(TextStyle::Monospace.resolve(ui.style()).size);
         let cell = ui.fonts(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
 
-        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click());
+        let (response, painter) =
+            ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = response.rect;
 
         self.resize(rect.size(), cell);
@@ -178,6 +195,9 @@ impl Terminal {
         if response.hovered() || response.has_focus() {
             self.process_scroll(ui);
         }
+
+        // Text selection (drag) and ⌘-click link opening.
+        self.handle_mouse(ui, &response, rect, cell);
 
         if self.needs_focus || response.clicked() {
             response.request_focus();
@@ -289,6 +309,112 @@ impl Terminal {
         }
     }
 
+    /// Drag-to-select text, double/triple-click word/line selection, and
+    /// ⌘-hover/⌘-click for opening URLs.
+    fn handle_mouse(&mut self, ui: &Ui, resp: &egui::Response, rect: Rect, cell: Vec2) {
+        let cmd = ui.input(|i| i.modifiers.mac_cmd || i.modifiers.command);
+
+        // ⌘ + hover: highlight the link under the pointer.
+        self.hovered_link = None;
+        if cmd {
+            if let Some(pos) = resp.hover_pos() {
+                if let Some(m) = self.link_at(self.point_at(pos, rect, cell)) {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    self.hovered_link = Some(m);
+                }
+            }
+        }
+
+        if resp.triple_clicked() {
+            self.begin_selection(SelectionType::Lines, resp, rect, cell);
+        } else if resp.double_clicked() {
+            self.begin_selection(SelectionType::Semantic, resp, rect, cell);
+        } else if resp.drag_started() {
+            self.begin_selection(SelectionType::Simple, resp, rect, cell);
+        } else if resp.dragged() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let (point, side) = (self.point_at(pos, rect, cell), self.side_at(pos, cell));
+                let mut term = self.term.lock();
+                if let Some(sel) = term.selection.as_mut() {
+                    sel.update(point, side);
+                }
+            }
+        } else if resp.clicked() {
+            match (cmd, self.hovered_link.clone()) {
+                (true, Some(link)) => self.open_link(&link),
+                _ => self.term.lock().selection = None,
+            }
+        }
+    }
+
+    fn begin_selection(
+        &self,
+        ty: SelectionType,
+        resp: &egui::Response,
+        rect: Rect,
+        cell: Vec2,
+    ) {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let point = self.point_at(pos, rect, cell);
+            let side = self.side_at(pos, cell);
+            self.term.lock().selection = Some(Selection::new(ty, point, side));
+        }
+    }
+
+    /// Map a screen position to a grid point, accounting for scrollback offset.
+    fn point_at(&self, pos: Pos2, rect: Rect, cell: Vec2) -> Point {
+        let col = (((pos.x - rect.min.x) / cell.x) as i32).clamp(0, self.cols as i32 - 1) as usize;
+        let line = (((pos.y - rect.min.y) / cell.y) as i32).clamp(0, self.lines as i32 - 1) as usize;
+        let offset = self.term.lock().grid().display_offset();
+        viewport_to_point(offset, Point::new(line, Column(col)))
+    }
+
+    fn side_at(&self, pos: Pos2, cell: Vec2) -> Side {
+        let within = (pos.x).rem_euclid(cell.x);
+        if within > cell.x / 2.0 {
+            Side::Right
+        } else {
+            Side::Left
+        }
+    }
+
+    /// Find a URL match at `point`, scanning the visible viewport (± a margin).
+    fn link_at(&self, point: Point) -> Option<Match> {
+        let mut regex = self.url_regex.clone();
+        let term = self.term.lock();
+        let viewport_start = Line(-(term.grid().display_offset() as i32));
+        let viewport_end = viewport_start + term.bottommost_line();
+        let mut start = term.line_search_left(Point::new(viewport_start, Column(0)));
+        let mut end = term.line_search_right(Point::new(viewport_end, Column(0)));
+        start.line = start.line.max(viewport_start - 100);
+        end.line = end.line.min(viewport_end + 100);
+        RegexIter::new(start, end, Direction::Right, &term, &mut regex)
+            .skip_while(|m| m.end().line < viewport_start)
+            .take_while(|m| m.start().line <= viewport_end)
+            .find(|m| m.contains(&point))
+    }
+
+    fn open_link(&self, m: &Match) {
+        let url = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            let start = *m.start();
+            let mut s = String::from(grid[start].c);
+            for indexed in grid.iter_from(start) {
+                s.push(indexed.c);
+                if indexed.point == *m.end() {
+                    break;
+                }
+            }
+            s
+        };
+        let url = url.trim().to_string();
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+        #[cfg(not(target_os = "macos"))]
+        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    }
+
     fn process_input(&self, ui: &Ui) {
         let (app_cursor, bracketed_paste) = {
             let mode = *self.term.lock().mode();
@@ -326,6 +452,15 @@ impl Terminal {
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
                     out.extend_from_slice(t.as_bytes());
                 }
+                // ⌘C (mac) / Ctrl+Shift+C copies the current selection rather
+                // than sending a byte to the child.
+                egui::Event::Copy => {
+                    if let Some(text) = self.term.lock().selection_to_string() {
+                        if !text.is_empty() {
+                            ui.ctx().copy_text(text);
+                        }
+                    }
+                }
                 egui::Event::Key {
                     key,
                     pressed: true,
@@ -341,7 +476,9 @@ impl Terminal {
         }
         if !out.is_empty() {
             self.notifier.notify(out);
-            self.term.lock().scroll_display(Scroll::Bottom);
+            let mut term = self.term.lock();
+            term.scroll_display(Scroll::Bottom);
+            term.selection = None; // typing dismisses the selection
         }
     }
 
@@ -349,6 +486,7 @@ impl Terminal {
         painter.rect_filled(rect, 0.0, theme::INSET);
 
         let term = self.term.lock();
+        let selection = term.selection.as_ref().and_then(|s| s.to_range(&term));
         let grid = term.grid();
         let display_offset = grid.display_offset() as i32;
         let cursor = grid.cursor.point;
@@ -374,9 +512,14 @@ impl Terminal {
             if flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
                 fg = fg.linear_multiply(0.7);
             }
-            if flags.contains(Flags::INVERSE) {
+            let is_selected = selection.as_ref().is_some_and(|r| r.contains(indexed.point));
+            if flags.contains(Flags::INVERSE) || is_selected {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            let is_link = self
+                .hovered_link
+                .as_ref()
+                .is_some_and(|m| m.contains(&indexed.point));
 
             let is_cursor = indexed.point == cursor;
 
@@ -396,6 +539,14 @@ impl Terminal {
             }
 
             let ch = indexed.c;
+            if is_link {
+                fg = theme::ACCENT;
+                let uy = y + cell.y - 1.0;
+                painter.line_segment(
+                    [Pos2::new(x, uy), Pos2::new(x + cw, uy)],
+                    Stroke::new(1.0, theme::ACCENT),
+                );
+            }
             if ch != ' ' && ch != '\t' {
                 painter.text(
                     Pos2::new(x + cw / 2.0, y),

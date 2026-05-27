@@ -137,7 +137,11 @@ pub fn push_origin(workdir: &Path, branch: &str) -> Result<String, String> {
 /// Walk history from HEAD (newest first), up to `max` commits.
 pub fn list_commits(repo: &Repository, max: usize) -> Result<Vec<CommitInfo>, git2::Error> {
     let mut walk = repo.revwalk()?;
-    walk.push_head()?;
+    // An unborn branch (fresh repo, no commits yet) has no HEAD reference to
+    // push — that's not an error, just an empty history.
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
     walk.set_sorting(git2::Sort::TIME)?;
 
     let mut out = Vec::new();

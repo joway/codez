@@ -1200,13 +1200,13 @@ impl Editor {
                         )
                     };
                     ui.label(egui::RichText::new(count).color(theme::TEXT_DIM));
-                    if ui.button("‹").on_hover_text("Previous (⇧⌘G)").clicked() {
+                    if theme::icon_button(ui, "‹", "Previous (⇧⌘G)") {
                         self.find_prev();
                     }
-                    if ui.button("›").on_hover_text("Next (⌘G)").clicked() {
+                    if theme::icon_button(ui, "›", "Next (⌘G)") {
                         self.find_next();
                     }
-                    if ui.button("✕").clicked() {
+                    if theme::icon_button(ui, "×", "Close") {
                         close = true;
                     }
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1221,10 +1221,10 @@ impl Editor {
                                 .hint_text("Replace")
                                 .desired_width(240.0),
                         );
-                        if ui.button("Replace").clicked() {
+                        if theme::pill_button(ui, "Replace") {
                             self.replace_current();
                         }
-                        if ui.button("All").clicked() {
+                        if theme::pill_button(ui, "All") {
                             self.replace_all();
                         }
                     });
@@ -1435,7 +1435,7 @@ impl Editor {
         if let Some(offset) = scroll_offset {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
-        scroll_area.show_rows(ui, row_h, total, |ui, range| {
+        let scroll_out = scroll_area.show_rows(ui, row_h, total, |ui, range| {
             for line_idx in range {
                 let text = view.line_text(line_idx);
                 let mut job = LayoutJob::default();
@@ -1580,6 +1580,11 @@ impl Editor {
                 }
             }
         });
+
+        // Show the text (I-beam) cursor over the editing area, not the arrow.
+        if ui.rect_contains_pointer(scroll_out.inner_rect) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
 
         self.apply_pointer(&p, hit);
 

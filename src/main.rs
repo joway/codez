@@ -3,6 +3,7 @@
 
 mod agent;
 mod app;
+mod cli;
 mod editor;
 mod fstree;
 mod gitmodel;
@@ -14,6 +15,7 @@ mod settings;
 mod terminal;
 mod textview;
 mod theme;
+mod usage;
 
 use std::path::PathBuf;
 
@@ -24,7 +26,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 480.0])
-            .with_title(""),
+            .with_title("")
+            .with_icon(app_icon()),
         ..Default::default()
     };
 
@@ -44,6 +47,32 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(CodezApp::new(dir, file)))
         }),
     )
+}
+
+fn app_icon() -> egui::IconData {
+    const ICON: &[u8] = include_bytes!("../assets/logo-256.png");
+
+    let decoder = png::Decoder::new(std::io::Cursor::new(ICON));
+    let mut reader = decoder
+        .read_info()
+        .expect("embedded app icon should be a valid PNG");
+    let mut rgba = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut rgba)
+        .expect("embedded app icon should decode");
+    rgba.truncate(info.buffer_size());
+
+    assert_eq!(
+        (info.color_type, info.bit_depth),
+        (png::ColorType::Rgba, png::BitDepth::Eight),
+        "embedded app icon must be 8-bit RGBA"
+    );
+
+    egui::IconData {
+        rgba,
+        width: info.width,
+        height: info.height,
+    }
 }
 
 /// Set the whole application's appearance to dark aqua so the native titlebar

@@ -2,7 +2,46 @@
 //! the syntax highlighter and the diff renderer. Colors mirror GitHub's
 //! "dark default" design tokens.
 
-use egui::{Color32, Rounding, Stroke, Visuals};
+use egui::{Align2, Color32, CursorIcon, FontId, Rounding, Sense, Stroke, Ui, Vec2, Visuals};
+
+/// A flat, frameless icon button (VS Code style): no border, a subtle rounded
+/// fill on hover, a single monochrome glyph. Returns true when clicked.
+pub fn icon_button(ui: &mut Ui, glyph: &str, tooltip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    let resp = resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(tooltip);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, SIDEBAR_HOVER);
+    }
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(15.0),
+        if resp.hovered() { TEXT } else { TEXT_DIM },
+    );
+    resp.clicked()
+}
+
+/// A flat secondary text button (VS Code style): thin border, subtle fill that
+/// lifts on hover. Returns true when clicked.
+pub fn pill_button(ui: &mut Ui, label: &str) -> bool {
+    let font = FontId::proportional(13.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, TEXT);
+    let size = galley.size();
+    let (rect, resp) = ui.allocate_exact_size(size + Vec2::new(20.0, 10.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let fill = if resp.hovered() { RAISED } else { INSET };
+    ui.painter().rect_filled(rect, 4.0, fill);
+    ui.painter()
+        .rect_stroke(rect, 4.0, Stroke::new(1.0, BORDER));
+    ui.painter()
+        .galley(rect.center() - size / 2.0, galley, TEXT);
+    resp.clicked()
+}
 
 // --- Surfaces -------------------------------------------------------------
 pub const SURFACE: Color32 = Color32::from_rgb(0x16, 0x1b, 0x22); // panels
