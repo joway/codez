@@ -131,6 +131,17 @@ echo "==> Signing .dmg"
 codesign --force "${CODESIGN_TIMESTAMP[@]}" --sign "$SIGN_IDENTITY" "$DMG"
 codesign --verify --verbose=2 "$DMG"
 
+if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* && -z "$NOTARY_PROFILE" ]]; then
+  echo "error: Developer ID builds must be notarized before public distribution."
+  echo "Create a notarytool profile once:"
+  echo "  xcrun notarytool store-credentials codez-notary"
+  echo "Then rerun:"
+  echo "  CODEZ_NOTARY_PROFILE=codez-notary ./scripts/package-macos.sh"
+  echo
+  echo "For local-only unsigned notarization testing, use an Apple Development identity instead."
+  exit 1
+fi
+
 if [[ -n "$NOTARY_PROFILE" ]]; then
   echo "==> Notarizing .dmg"
   xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait

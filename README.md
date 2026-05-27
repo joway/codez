@@ -55,7 +55,9 @@ security find-identity -v -p codesigning
 `scripts/package-macos.sh` prefers a `Developer ID Application` certificate. If
 none is installed, it falls back to an `Apple Development` certificate for
 local/test builds. Public downloads should use Developer ID signing and
-notarization.
+notarization. When a Developer ID certificate is used, the script requires
+`CODEZ_NOTARY_PROFILE`; this prevents publishing a DMG that macOS rejects as
+unnotarized.
 
 To force a specific identity:
 
@@ -63,13 +65,27 @@ To force a specific identity:
 export CODEZ_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 ```
 
-To notarize during packaging, create a notarytool keychain profile once:
+To notarize during packaging, create an App Store Connect API key:
+
+1. Open `https://appstoreconnect.apple.com/access/integrations/api`.
+2. Go to `Users and Access` → `Integrations` → `App Store Connect API` → `Keys`.
+3. Create a key such as `CodeZ Notary`.
+4. Download the `.p8` private key. It can only be downloaded once.
+5. Record the Key ID and Issuer ID from App Store Connect.
+
+Store those credentials in the keychain once:
 
 ```sh
-xcrun notarytool store-credentials codez-notary
+xcrun notarytool store-credentials codez-notary \
+  --key ~/Keys/AuthKey_<KEY_ID>.p8 \
+  --key-id <KEY_ID> \
+  --issuer <ISSUER_ID>
 ```
 
-Then package with:
+If App Store Connect gives you an individual API key and `notarytool` rejects
+`--issuer`, retry the same command without `--issuer`.
+
+Then enable notarization for packaging:
 
 ```sh
 export CODEZ_NOTARY_PROFILE=codez-notary
